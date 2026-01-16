@@ -761,6 +761,18 @@ with right_col:
     selected_banks = st.multiselect("Banks (toggle on/off)", bank_list, default=default_sel)
 
     st.markdown("---")
+
+    st.subheader("Complex module (ΔROE)")
+    util = st.slider("Utilization (%)", 50, 100, 85, 1) / 100.0
+
+    override = st.checkbox("Override bank-specific cost/tax with global values", value=False)
+    override_srt_cost_bp = override_tax_rate = None
+    if override:
+        override_srt_cost_bp = st.slider("Global SRT Cost (bp)", 0, 100, 20, 5)
+        override_tax_rate = st.slider("Global Tax rate (%)", 0, 50, 25, 1) / 100.0
+
+
+
     st.subheader("Transition engine controls")
 
     st.markdown("**SRT-eligible share of donor assets (% of each donor bucket, max 10%)**")
@@ -777,18 +789,21 @@ with right_col:
         "B1_CRE_NON_HVCRE": float(avail_cre),
     }
 
-    require_exact = st.checkbox("Require exact annual RWA target", value=False)
+    # Sidebar toggles removed as requested
+    require_exact = False
     tol_pct = st.slider("Target tolerance (%)", 0.0, 5.0, 0.5, 0.1)
 
-    show_audit = st.checkbox("Show transition audit table", value=False)
+    show_audit = False
 
     # Placeholder for capacity indicator (filled after model run)
     capacity_placeholder = st.empty()
 
     st.markdown("---")
     st.subheader("Offload Display")
-    metric = st.radio("Metric", ["% der RWA", "Assets (EUR bn)", "RWA (EUR bn)"], index=1)
-    agg = st.radio("Aggregation", ["Total (Horizont)", "jährlich"], index=0)
+
+    # Offload Display toggles removed as requested (fixed defaults)
+    metric = "Assets (EUR bn)"
+    agg = "Total (Horizont)"
 
     assets_method = st.radio(
         "Assets offload method",
@@ -817,16 +832,6 @@ with right_col:
     eff4 = st.slider("D (Custom)", 0.0, 1.0, 0.80, 0.01)
 
     st.markdown("---")
-    st.subheader("Complex module (ΔROE)")
-    util = st.slider("Utilization (%)", 50, 100, 85, 1) / 100.0
-
-    override = st.checkbox("Override bank-specific cost/tax with global values", value=False)
-    override_srt_cost_bp = override_tax_rate = None
-    if override:
-        override_srt_cost_bp = st.slider("Global SRT Cost (bp)", 0, 100, 20, 5)
-        override_tax_rate = st.slider("Global Tax rate (%)", 0, 50, 25, 1) / 100.0
-
-
 # Validate selections
 if not selected_banks:
     st.error("Please select at least one bank in the sidebar.")
@@ -1032,7 +1037,7 @@ with left_col:
     st.plotly_chart(fig1, use_container_width=True)
 
     st.markdown("---")
-    st.subheader("2) Offload Complex (ΔROE & SRI)")
+    st.subheader("2) Offload Complex (ΔROE)")
 
     fig2 = px.bar(
         roe_df,
@@ -1046,19 +1051,6 @@ with left_col:
         title="ΔROE (bp p.a.) – Transition-based redeployment"
     )
     st.plotly_chart(fig2, use_container_width=True)
-
-    fig3 = px.bar(
-        sri_df,
-        x="Scenario",
-        y="SRI",
-        color="SRT_Efficiency",
-        barmode="group",
-        facet_col="Bank",
-        facet_col_wrap=3,
-        labels={"SRI": "SRI (%)", "Scenario": "", "SRT_Efficiency": "SRT-Effizienz"},
-        title="System Risk Index (SRI) – Anteil ausgelagerter Assets (pro Bank)"
-    )
-    st.plotly_chart(fig3, use_container_width=True)
 
     st.markdown(
         """
@@ -1100,25 +1092,7 @@ with left_col:
     )
     st.plotly_chart(figP2, use_container_width=True)
 
-    figP3 = px.bar(
-        sri_port,
-        x="Scenario",
-        y="SRI",
-        color="SRT_Efficiency",
-        barmode="group",
-        labels={"SRI": "SRI (%)", "Scenario": "", "SRT_Efficiency": "SRT-Effizienz"},
-        title="SRI (%) – Portfolio"
-    )
-    st.plotly_chart(figP3, use_container_width=True)
-
-    if show_audit:
-        st.markdown("---")
-        st.subheader("Transition Audit (per-row allocations)")
-        audit_df = roe_df.attrs.get("allocations_audit_df")
-        if isinstance(audit_df, pd.DataFrame) and not audit_df.empty:
-            st.dataframe(audit_df, use_container_width=True, height=420)
-        else:
-            st.info("No audit rows (likely no eligible transitions or zero targets).")
+    # Transition audit table removed from UI as requested
 
 
 # ---- XLSX Export ----
