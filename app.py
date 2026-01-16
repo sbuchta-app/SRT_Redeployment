@@ -1,6 +1,11 @@
 import io
+import re
 from dataclasses import dataclass
 from typing import Dict, Tuple, List, Optional
+
+# Global constant: total assets column name
+TOTAL_ASSETS_COL = "Total Assets (EUR bn)"
+
 
 import numpy as np
 import pandas as pd
@@ -334,6 +339,55 @@ def donor_split_from_row(row: pd.Series, default_split: Optional[Dict[str, float
             if np.isfinite(v) and v >= 0:
                 base[donor] = v / 100.0
     return base
+
+
+def donor_eligible_exposure_long(
+    banks_df: pd.DataFrame,
+    donor_availability_pct_by_donor: Optional[Dict[str, float]] = None,
+    donor_split_override_by_bank: Optional[Dict[str, Dict[str, float]]] = None,
+) -> pd.DataFrame:
+    """Return long df of eligible donor exposure per bank (EUR bn).
+
+    Eligible exposure = Total Assets * donor split * availability cap (percent).
+    Availability caps are in percent (e.g. 10 -> 10%). Missing donors default to 100%.
+    """
+    rows: list[dict] = []
+    for _, r in banks_df.iterrows():
+        bank = str(r.get("Bank", ""))
+        if not bank or bank == "nan":
+            bank = str(r.get("Bank Name", ""))
+        ta = float(r.get("Total Assets (EUR bn)", np.nan))
+        if not np.isfinite(ta):
+            continue
+        split = donor_split_from_row(r, DEFAULT_DONOR_SPLIT_OF_TOTAL_ASSETS)
+        # apply optional override dict by bank name
+        if donor_split_override_by_bank and bank in donor_split_override_by_bank:
+            for d, v in donor_split_override_by_bank[bank].items():
+                try:
+                    split[d] = float(v)
+                except Exception:
+                    pass
+        for donor, w in split.items():
+            try:
+                w_f = float(w)
+            except Exception:
+                continue
+            if not np.isfinite(w_f) or w_f <= 0:
+                continue
+            expo = ta * w_f
+            cap_pct = 100.0
+            if donor_availability_pct_by_donor and donor in donor_availability_pct_by_donor:
+                try:
+                    cap_pct = float(donor_availability_pct_by_donor.get(donor, 100.0))
+                except Exception:
+                    cap_pct = 100.0
+            if np.isfinite(cap_pct):
+                cap_pct = max(min(cap_pct, 100.0), 0.0)
+            else:
+                cap_pct = 100.0
+            expo_elig = expo * cap_pct / 100.0
+            rows.append({"Bank": bank, "Donor": donor, "Eligible_Exposure_EUR_bn": expo_elig})
+    return pd.DataFrame(rows)
 
 def build_donor_exposures_from_total_assets(
     total_assets_eur_bn: float,
@@ -742,7 +796,7 @@ with right_col:
     st.header("Global Controls")
 
     # Defaults requested: time horizon starts at 5 years
-    years = st.slider("Horizont (Jahre)", min_value=1, max_value=10, value=5, step=1)
+    years = st.slider("Time horizon (years)", min_value=1, max_value=10, value=5, step=1)
 
     # No Country/Region filtering for now
     banks_f = banks.copy()
@@ -757,13 +811,41 @@ with right_col:
     default_sel = [b for b in preferred_defaults if b in bank_list]
     if not default_sel:
         default_sel = bank_list[: min(8, len(bank_list))]
+    # Per-bank toggles (multiple banks can be selected)
+    st.caption("Select one or more banks:")
 
-    selected_banks = st.multiselect("Banks (toggle on/off)", bank_list, default=default_sel)
+    def _safe_bank_key(name: str) -> str:
+        return re.sub(r"[^a-zA-Z0-9_]+", "_", str(name))
+
+    # Defaults: prefer LBBW and Deutsche Bank if present; otherwise fall back to first bank
+    preferred_defaults = [b for b in ["LBBW", "Deutsche Bank"] if b in bank_list]
+    if not preferred_defaults and bank_list:
+        preferred_defaults = [bank_list[0]]
+
+    if "selected_banks" not in st.session_state:
+        st.session_state["selected_banks"] = preferred_defaults
+
+    selected_banks = []
+    for _b in bank_list:
+        _k = f"bank_cb_{_safe_bank_key(_b)}"
+        default_on = (_b in st.session_state.get("selected_banks", preferred_defaults))
+        val = st.checkbox(_b, key=_k, value=default_on)
+        if val:
+            selected_banks.append(_b)
+
+    st.session_state["selected_banks"] = selected_banks
 
     st.markdown("---")
 
     st.subheader("Complex module (ΔROE)")
-    util = st.slider("Utilization (%)", 50, 100, 85, 1) / 100.0
+    util = st.slider(
+        "Redeployment / CET1-Split (%)",
+        min_value=50,
+        max_value=100,
+        value=85,
+        step=1,
+        help="Defines how RWAs freed by offloading are used. 100% means 100% of freed RWAs are redeployed into new assets and 0% go to CET1 uplift. 0% means 0% are redeployed and 100% go to CET1 uplift. Intermediate values split proportionally.",
+    ) / 100.0
 
     override = st.checkbox("Override bank-specific cost/tax with global values", value=False)
     override_srt_cost_bp = override_tax_rate = None
@@ -788,6 +870,9 @@ with right_col:
         "B1_EM_CORP": float(avail_em),
         "B1_CRE_NON_HVCRE": float(avail_cre),
     }
+
+    # Optional per-bank donor split override (not used unless you add controls for it)
+    donor_split_override = None
 
     # Sidebar toggles removed as requested
     require_exact = False
@@ -818,18 +903,16 @@ with right_col:
     )
 
     st.markdown("---")
-    st.subheader("Scenarios (US advantage in bps)")
-    scen_enable = st.multiselect("Enabled scenarios", ["S1", "S2", "S3", "Custom"], default=["S1", "S2", "S3"])
-    s1_bps = st.slider("S1 (bp)", 0, 300, 80, 5)
-    s2_bps = st.slider("S2 (bp)", 0, 300, 168, 5)
-    s3_bps = st.slider("S3 (bp)", 0, 400, 218, 5)
-    cust_bps = st.slider("Custom (bp)", 0, 400, 120, 5)
+    st.subheader("Scenario (US advantage in bps)")
+
+    # Single-scenario setup (replaces the former S1/S2/S3/Custom set)
+    scenario_bps = st.slider("US advantage (bp)", 0, 400, 168, 5)
 
     st.subheader("SRT efficiencies")
-    eff1 = st.slider("A", 0.0, 1.0, 0.60, 0.01)
-    eff2 = st.slider("B", 0.0, 1.0, 0.75, 0.01)
-    eff3 = st.slider("C", 0.0, 1.0, 0.90, 0.01)
-    eff4 = st.slider("D (Custom)", 0.0, 1.0, 0.80, 0.01)
+
+    # Single SRT efficiency (replaces A/B/C/D sliders)
+    srt_eff = st.slider("SRT efficiency", 0.0, 1.0, 0.75, 0.01)
+
 
     st.markdown("---")
 # Validate selections
@@ -839,21 +922,10 @@ if not selected_banks:
 
 banks_sel = banks_f[banks_f["Bank Name"].isin(selected_banks)].copy()
 
-# Build scenarios dict
-scenarios = {}
-if "S1" in scen_enable:
-    scenarios["S1_Partial_US_Easing"] = s1_bps
-if "S2" in scen_enable:
-    scenarios["S2_Full_US_Easing"] = s2_bps
-if "S3" in scen_enable:
-    scenarios["S3_US_Easing_plus_EU_Tightening"] = s3_bps
-if "Custom" in scen_enable:
-    scenarios["Custom"] = cust_bps
-if not scenarios:
-    st.error("Please enable at least one scenario.")
-    st.stop()
+# Build single-scenario dict
+scenarios = {"US_Advantage": scenario_bps}
 
-effs = sorted({round(e, 4) for e in [eff1, eff2, eff3, eff4]})
+effs = [round(float(srt_eff), 4)]
 
 portfolio_df = make_portfolio_row(banks_sel)
 
@@ -886,46 +958,7 @@ roe_df = compute_roe_delta_transitions_greedy(
 sri_df = compute_sri(sim_df, banks_sel)
 
 
-# ============================================================
-# Sidebar capacity indicator (lights up when target not met)
-# ============================================================
-def _is_insufficient_transition(status: object) -> bool:
-    """Return True if the transition engine could not meet the annual RWA target."""
-    s = str(status) if status is not None else ""
-    if s == "OK":
-        return False
-    # Anything else implies infeasibility / non-compliance with target (incl. tolerance / exact).
-    return True
 
-
-insufficient_rows = roe_df[roe_df["Transition_status"].apply(_is_insufficient_transition)]
-insufficient_rows_port = roe_port[roe_port["Transition_status"].apply(_is_insufficient_transition)]
-insufficient_any = (not insufficient_rows.empty) or (not insufficient_rows_port.empty)
-
-with capacity_placeholder.container():
-    st.markdown("---")
-    st.subheader("SRT Capacity Check")
-
-    if insufficient_any:
-        st.error("🚨 Insufficient SRT-eligible assets: target annual RWA reduction cannot be met for all combinations.")
-        st.caption(
-            "Reduce the risk by increasing donor availability sliders or relaxing the target tolerance/exactness settings."
-        )
-
-        # A button-like interaction to reveal details
-        if st.button("Show failing combinations"):
-            cols = [
-                "Bank",
-                "Scenario",
-                "SRT_Efficiency",
-                "Years",
-                "Transition_status",
-                "RWA_reduction_achieved_Yr",
-            ]
-            st.dataframe(insufficient_rows[cols], use_container_width=True, height=240)
-            st.dataframe(insufficient_rows_port[cols], use_container_width=True, height=160)
-    else:
-        st.success("✅ Capacity sufficient: target annual RWA reduction is achievable for all displayed combinations.")
 
 # ---- Optional alternative assets-offload measure (transition-based) ----
 def _attach_transition_based_assets(sim: pd.DataFrame, roe: pd.DataFrame) -> pd.DataFrame:
@@ -1000,75 +1033,121 @@ def _attach_transition_based_assets(sim: pd.DataFrame, roe: pd.DataFrame) -> pd.
 sim_df = _attach_transition_based_assets(sim_df, roe_df)
 sim_port = _attach_transition_based_assets(sim_port, roe_port)
 
-# ---- Charts ----
+ 
+# ============================================================
+# Charts
+# ============================================================
 with left_col:
-    st.subheader("1) Offload (Simple)")
+    # Place "1) Offload (Simple)" and "2) Offload Complex (ΔROE)" side by side
+    c1, c2 = st.columns(2, gap="large")
 
-    if metric == "% der RWA" and agg == "Total (Horizont)":
-        yv, yl = "Gross_RWA_Offload_pct_of_RWA_Tot", "% der RWA (Total)"
-    elif metric == "% der RWA" and agg == "jährlich":
-        yv, yl = "Gross_RWA_Offload_pct_of_RWA_Yr", "% der RWA (jährlich)"
-    elif metric == "Assets (EUR bn)" and agg == "Total (Horizont)":
-        if assets_method == "Transition-based (donor RW)":
-            yv, yl = "Assets_Offloaded_Transition_EUR_bn_Tot", "Assets-Offload (EUR bn, Total, transition-based)"
-        else:
-            yv, yl = "Gross_Assets_Offloaded_EUR_bn_Tot", "Assets-Offload (EUR bn, Total)"
-    elif metric == "Assets (EUR bn)" and agg == "jährlich":
-        if assets_method == "Transition-based (donor RW)":
-            yv, yl = "Assets_Offloaded_Transition_EUR_bn_Yr", "Assets-Offload (EUR bn, jährlich, transition-based)"
-        else:
-            yv, yl = "Gross_Assets_Offloaded_EUR_bn_Yr", "Assets-Offload (EUR bn, jährlich)"
-    elif metric == "RWA (EUR bn)" and agg == "Total (Horizont)":
-        yv, yl = "Gross_RWA_Offload_EUR_bn_Tot", "RWA-Offload (EUR bn, Total)"
-    else:
-        yv, yl = "Gross_RWA_Offload_EUR_bn_Yr", "RWA-Offload (EUR bn, jährlich)"
+    with c1:
+        st.subheader("1) Offload (Simple)")
 
-    fig1 = px.bar(
-        sim_df,
-        x="Scenario",
-        y=yv,
-        color="SRT_Efficiency",
-        barmode="group",
-        facet_col="Bank",
-        facet_col_wrap=3,
-        labels={yv: yl, "Scenario": "", "SRT_Efficiency": "SRT-Effizienz"},
-        title="Erforderlicher Offload nach Szenario & Effizienz (pro Bank)"
-    )
-    st.plotly_chart(fig1, use_container_width=True)
+        # Fixed offload display settings (sidebar toggles removed)
+        yv_simple = "Assets_Offloaded_Transition_EUR_bn_Tot"
+        yl_simple = "Assets offloaded (EUR bn, total, transition-based)"
+
+        fig1 = px.bar(
+            sim_df,
+            x="Bank",
+            y=yv_simple,
+            color="Bank",
+            barmode="group",
+            labels={yv_simple: yl_simple,  "Bank": "Bank"},
+            title="Required offload (transition-based assets)"
+        )
+        st.plotly_chart(fig1, use_container_width=True)
+    with c2:
+        st.subheader("2) Offload Complex (ΔROE)")
+
+        fig2 = px.bar(
+            roe_df,
+            x="Bank",
+            y="ROE_delta_bp",
+            color="Bank",
+            barmode="group",
+            labels={"ROE_delta_bp": "ΔROE (bp p.a.)",  "Bank": "Bank"},
+            title="ΔROE (bp p.a.) – Banks (transition-based)"
+        )
+        st.plotly_chart(fig2, use_container_width=True)
 
     st.markdown("---")
-    st.subheader("2) Offload Complex (ΔROE)")
 
-    fig2 = px.bar(
-        roe_df,
-        x="Scenario",
-        y="ROE_delta_bp",
-        color="SRT_Efficiency",
-        barmode="group",
-        facet_col="Bank",
-        facet_col_wrap=3,
-        labels={"ROE_delta_bp": "ΔROE (bp p.a.)", "Scenario": "", "SRT_Efficiency": "SRT-Effizienz"},
-        title="ΔROE (bp p.a.) – Transition-based redeployment"
-    )
-    st.plotly_chart(fig2, use_container_width=True)
+    # ---- Donor utilization (how much of eligible donor assets are used) ----
+    # Per-year utilization, capped at 100% (availability sliders are per-year caps).
+    audit_alloc = roe_df.attrs.get("allocations_audit_df")
+    if not isinstance(audit_alloc, pd.DataFrame) or audit_alloc.empty:
+        st.info("Donor utilization chart not available (allocation audit data missing).")
+    else:
+        # Filter to the currently selected scenario/efficiency/horizon to avoid accidental averaging
+        _scenario_key = list(scenarios.keys())[0] if isinstance(scenarios, dict) and scenarios else None
+        _eff_val = effs[0] if isinstance(effs, list) and effs else None
 
-    st.markdown(
-        """
-        <div style="background:#f7f7f7;border:1px solid #ddd;border-radius:6px;padding:10px;margin-top:8px;">
-          <h5 style="margin:0 0 6px 0;">Szenarienbeschreibung</h5>
-          <ul style="margin:0; padding-left:18px;">
-            <li><b>S1 – Moderate US-Deregulierung:</b> Teilweise Lockerung der US-Stresstests (~80 bp CET1-Vorteil).</li>
-            <li><b>S2 – Volle US-Deregulierung:</b> Umfassende Entlastung (≈168 bp CET1-Vorteil).</li>
-            <li><b>S3 – US-Deregulierung + EU-Gegenwind:</b> Zusätzlicher EU-Impact, gesamt ≈218 bp.</li>
-            <li><b>Custom – Nutzerdefiniert:</b> frei einstellbarer CET1-Vorteil in bp.</li>
-          </ul>
-        </div>
-        """,
-        unsafe_allow_html=True
-    )
+        alloc_f = audit_alloc.copy()
+        if _scenario_key is not None and "Scenario" in alloc_f.columns:
+            alloc_f = alloc_f[alloc_f["Scenario"] == _scenario_key]
+        if _eff_val is not None and "SRT_Efficiency" in alloc_f.columns:
+            # Handle numeric or percentage-string representations (e.g. "75%")
+            eff_series = alloc_f["SRT_Efficiency"]
+            if eff_series.dtype == object:
+                eff_num = (
+                    eff_series.astype(str)
+                    .str.replace("%", "", regex=False)
+                    .str.strip()
+                    .astype(float) / 100.0
+                )
+            else:
+                eff_num = eff_series.astype(float)
+
+            alloc_f = alloc_f[np.isclose(eff_num, float(_eff_val))]
+        if "Years" in alloc_f.columns:
+            alloc_f = alloc_f[alloc_f["Years"] == years]
+
+        # Annual exposure used per bank+donor (EUR bn per year)
+        donor_used_bank = (
+            alloc_f.groupby(["Bank", "Donor"], as_index=False)
+            .agg({"Exposure_used_EUR_bn_Yr": "sum"})
+        )
+
+        # Eligible donor exposure stock per bank+donor (EUR bn) after applying donor split + availability cap sliders
+        donor_elig = donor_eligible_exposure_long(
+            banks_sel,
+            donor_availability_pct_by_donor=donor_availability_pct,
+            donor_split_override_by_bank=donor_split_override,
+        )
+
+        donor_util = donor_used_bank.merge(donor_elig, on=["Bank", "Donor"], how="left")
+
+        # Per-year utilization (% of eligible stock used per year)
+        donor_util["Utilization_pct_Yr"] = (
+            100.0 * donor_util["Exposure_used_EUR_bn_Yr"] / donor_util["Eligible_Exposure_EUR_bn"]
+        )
+        donor_util.loc[donor_util["Eligible_Exposure_EUR_bn"] <= 0, "Utilization_pct_Yr"] = 0.0
+        donor_util["Utilization_pct_Yr"] = donor_util["Utilization_pct_Yr"].clip(lower=0, upper=100)
+
+        # Sort for stable display
+        donor_util = donor_util.sort_values(["Donor", "Bank"])
+
+        st.markdown("### 3) Donor utilization – share of eligible donor assets used")
+        fig_util = px.bar(
+            donor_util,
+            x="Donor",
+            y="Utilization_pct_Yr",
+            color="Bank",
+            barmode="group",
+            labels={"Utilization_pct_Yr": "Utilization (% of eligible per year)", "Donor": "Donor bucket", "Bank": "Bank"},
+        )
+        fig_util.update_yaxes(range=[0, 100])
+        st.plotly_chart(fig_util, use_container_width=True)
+
 
     st.markdown("---")
     st.subheader("PORTFOLIO (aggregate across selected banks)")
+
+    # Fixed offload metric for portfolio (same as simple chart)
+    yv = yv_simple
+    yl = yl_simple
 
     figP1 = px.bar(
         sim_port,
@@ -1076,8 +1155,8 @@ with left_col:
         y=yv,
         color="SRT_Efficiency",
         barmode="group",
-        labels={yv: yl, "Scenario": "", "SRT_Efficiency": "SRT-Effizienz"},
-        title="Erforderlicher Offload – Portfolio"
+        labels={yv: yl,  "SRT_Efficiency": "SRT-Efficiency"},
+        title="Required Offload – Portfolio"
     )
     st.plotly_chart(figP1, use_container_width=True)
 
@@ -1087,18 +1166,16 @@ with left_col:
         y="ROE_delta_bp",
         color="SRT_Efficiency",
         barmode="group",
-        labels={"ROE_delta_bp": "ΔROE (bp p.a.)", "Scenario": "", "SRT_Efficiency": "SRT-Effizienz"},
+        labels={"ROE_delta_bp": "ΔROE (bp p.a.)",  "SRT_Efficiency": "SRT-Efficiency"},
         title="ΔROE (bp p.a.) – Portfolio (transition-based)"
     )
     st.plotly_chart(figP2, use_container_width=True)
-
-    # Transition audit table removed from UI as requested
 
 
 # ---- XLSX Export ----
 xlsx_bytes = to_xlsx_bytes(sim_df, roe_df, sri_df)
 st.download_button(
-    label="XLSX herunterladen",
+    label="Donwload XLSX",
     data=xlsx_bytes,
     file_name=f"offload_banks_{pd.Timestamp.today().date()}.xlsx",
     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
