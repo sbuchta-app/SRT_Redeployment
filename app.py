@@ -1043,7 +1043,7 @@ with left_col:
         facet_col="Bank",
         facet_col_wrap=3,
         labels={"ROE_delta_bp": "ΔROE (bp p.a.)", "Scenario": "", "SRT_Efficiency": "SRT-Effizienz"},
-        title="ΔROE (bp p.a.) – Transition-based redeployment (greedy)"
+        title="ΔROE (bp p.a.) – Transition-based redeployment"
     )
     st.plotly_chart(fig2, use_container_width=True)
 
