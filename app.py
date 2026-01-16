@@ -117,26 +117,33 @@ RECEIVER_RISK_WEIGHT: Dict[str, float] = {
 }
 
 
-def _best_cell_per_donor(
+def _eligible_cells_by_donor(
     donors: List[str],
     srt_efficiency: float,
     srt_cost_dec: float,
     delta_rwa_pp: Dict[Tuple[str, str], float],
-) -> Dict[str, Cell]:
-    """Pick the best receiver per donor using the new delta_s_eff formula.
+    delta_spread_bps: Dict[Tuple[str, str], float],
+) -> Dict[str, List[Cell]]:
+    """Return all *eligible* receiver cells per donor.
 
-    Eligibility:
-      - delta_rwa_pp must be negative (RWA density improvement)
-      - delta_s_eff_bps must be > 1.0
-    Ranking metric:
-      - ratio = delta_s_eff_dec / (donor_risk_weight * srt_efficiency)
-        i.e., profitability per unit of RWA reduction.
+    Eligibility (transition permitted):
+      - DELTA_RWA_PP_B cell value must be < -1.0
+      - DELTA_SPREAD_BPS_B cell value must be > 0
+
+    Note: We do **no prioritization** across receivers. Allocation will split
+    a donor's used exposure equally across all eligible receivers.
+
+    We still compute delta_s_eff_dec and ratio for reporting/auditing.
     """
-    best: Dict[str, Cell] = {}
+    cells: Dict[str, List[Cell]] = {d: [] for d in donors}
     eff = float(srt_efficiency)
 
     for (d, r), drwa in delta_rwa_pp.items():
         if d not in donors:
+            continue
+
+        dspr = delta_spread_bps.get((d, r))
+        if dspr is None:
             continue
 
         donor_rw = float(DONOR_RISK_WEIGHT.get(d, 0.0))
@@ -146,68 +153,67 @@ def _best_cell_per_donor(
         if donor_rw <= 0 or receiver_rw <= 0:
             continue
 
-        # must improve RWA density
-        if not (drwa < 0):
+        # permitted transitions:
+        if not (float(drwa) < -1.0 and float(dspr) > 0.0):
             continue
 
-        delta_rwa_density = (-float(drwa))  # use as-is (quotient/multiplier, positive)
-        abs_spread_bps = abs_spread_bps  # already in bps
+        # delta_rwa_density stays "as-is" (you use quotient-like values)
+        delta_rwa_density = (-float(drwa))
 
-        # New economics term (work in bps, then convert to decimal)
+        # economics term (bps -> decimal)
         srt_cost_bp = float(srt_cost_dec) * 10000.0
         delta_s_eff_bps = delta_rwa_density * eff * abs_spread_bps - 2.0 * srt_cost_bp
         delta_s_eff_dec = delta_s_eff_bps / 10000.0
 
-        if delta_s_eff_bps <= 1.0:
-            continue
-
         rwa_red_per_eur = donor_rw * eff
-        if rwa_red_per_eur <= 0:
-            continue
+        ratio = (delta_s_eff_dec / rwa_red_per_eur) if rwa_red_per_eur > 0 else 0.0
 
-        ratio = delta_s_eff_dec / rwa_red_per_eur
-
-        cand = Cell(
-            donor=d,
-            receiver=r,
-            delta_rwa_pp=float(drwa),
-            donor_risk_weight=donor_rw,
-            receiver_risk_weight=receiver_rw,
-            abs_net_spread_bps=abs_spread_bps,
-            delta_s_eff_dec=float(delta_s_eff_dec),
-            ratio=float(ratio),
+        cells[d].append(
+            Cell(
+                donor=d,
+                receiver=r,
+                delta_rwa_pp=float(drwa),
+                donor_risk_weight=donor_rw,
+                receiver_risk_weight=receiver_rw,
+                abs_net_spread_bps=abs_spread_bps,
+                delta_s_eff_dec=float(delta_s_eff_dec),
+                ratio=float(ratio),
+            )
         )
 
-        if (d not in best) or (cand.ratio > best[d].ratio):
-            best[d] = cand
-
-    return best
+    # drop donors with no eligible receivers
+    return {d: lst for d, lst in cells.items() if lst}
 
 
-def greedy_allocate_rwa_reduction(
+def allocate_rwa_reduction_equal_receivers(
     rwa_target_eur_bn: float,
     donor_exposure_eur_bn: Dict[str, float],
     srt_efficiency: float,
     srt_cost_dec: float,
 ) -> Dict[str, object]:
-    """Greedy allocator (Segment B only).
+    """Allocator (Segment B only) with *equal split across eligible receivers*.
 
-    RWA reduction achieved per allocation is computed as:
+    Changes vs earlier greedy version:
+      - No prioritization across donors by profitability.
+      - For each donor, exposure used is split equally across all eligible receivers.
+
+    RWA reduction achieved per allocation line:
         rwa_reduction = exposure_used * donor_risk_weight * srt_efficiency
 
-    Assets redeployed used per allocation is computed as:
+    Assets redeployed used per allocation line (receiver-side):
         assets_redeploy = rwa_reduction / receiver_risk_weight
     """
     donors = [d for d in B1_DONORS if donor_exposure_eur_bn.get(d, 0.0) > 0]
 
-    best = _best_cell_per_donor(
+    cells_by_donor = _eligible_cells_by_donor(
         donors=donors,
         srt_efficiency=float(srt_efficiency),
         srt_cost_dec=float(srt_cost_dec),
         delta_rwa_pp=DELTA_RWA_PP_B,
+        delta_spread_bps=DELTA_SPREAD_BPS_B,
     )
 
-    if not best:
+    if not cells_by_donor:
         return {
             "allocations": [],
             "total_rwa_reduction_eur_bn": 0.0,
@@ -218,8 +224,6 @@ def greedy_allocate_rwa_reduction(
             "status": "NO_ELIGIBLE_TRANSITIONS",
         }
 
-    ranked = sorted(best.keys(), key=lambda d: best[d].ratio, reverse=True)
-
     remaining = float(rwa_target_eur_bn)
     allocs: List[Allocation] = []
     total_rwa_red = 0.0
@@ -228,48 +232,59 @@ def greedy_allocate_rwa_reduction(
 
     eff = float(srt_efficiency)
 
-    for d in ranked:
+    # No prioritization: iterate donors in fixed order
+    for d in B1_DONORS:
         if remaining <= 0:
             break
+        if d not in cells_by_donor:
+            continue
 
-        cell = best[d]
         expo_avail = float(donor_exposure_eur_bn.get(d, 0.0))
         if expo_avail <= 0:
             continue
 
-        # NEW: RWA reduction per EUR exposure moved
-        red_per_eur = float(cell.donor_risk_weight) * eff
+        # donor RWA reduction per EUR exposure moved
+        donor_rw = float(DONOR_RISK_WEIGHT.get(d, 0.0))
+        red_per_eur = donor_rw * eff
         if red_per_eur <= 0:
             continue
 
         expo_needed = remaining / red_per_eur
-        expo_used = min(expo_avail, expo_needed)
+        expo_used_total = min(expo_avail, expo_needed)
+        if expo_used_total <= 0:
+            continue
 
-        rwa_red = expo_used * red_per_eur
+        # Split equally across eligible receivers
+        cells = cells_by_donor[d]
+        k = len(cells)
+        expo_each = expo_used_total / k
 
-        # NEW: assets redeployed used on the receiver side
-        assets_redeploy = rwa_red / float(cell.receiver_risk_weight)
+        for cell in cells:
+            expo_used = expo_each
+            rwa_red = expo_used * red_per_eur
+            assets_redeploy = rwa_red / float(cell.receiver_risk_weight)
 
-        allocs.append(
-            Allocation(
-                donor=cell.donor,
-                receiver=cell.receiver,
-                exposure_used_eur_bn=expo_used,
-                rwa_reduction_eur_bn=rwa_red,
-                assets_redeploy_used_eur_bn=assets_redeploy,
-                donor_risk_weight=cell.donor_risk_weight,
-                receiver_risk_weight=cell.receiver_risk_weight,
-                delta_rwa_pp=cell.delta_rwa_pp,
-                abs_net_spread_bps=cell.abs_net_spread_bps,
-                delta_s_eff_dec=cell.delta_s_eff_dec,
-                ratio=cell.ratio,
+            allocs.append(
+                Allocation(
+                    donor=cell.donor,
+                    receiver=cell.receiver,
+                    exposure_used_eur_bn=expo_used,
+                    rwa_reduction_eur_bn=rwa_red,
+                    assets_redeploy_used_eur_bn=assets_redeploy,
+                    donor_risk_weight=cell.donor_risk_weight,
+                    receiver_risk_weight=cell.receiver_risk_weight,
+                    delta_rwa_pp=cell.delta_rwa_pp,
+                    abs_net_spread_bps=cell.abs_net_spread_bps,
+                    delta_s_eff_dec=cell.delta_s_eff_dec,
+                    ratio=cell.ratio,
+                )
             )
-        )
 
-        total_expo += expo_used
-        total_rwa_red += rwa_red
-        total_assets_redeploy += assets_redeploy
-        remaining -= rwa_red
+            total_expo += expo_used
+            total_rwa_red += rwa_red
+            total_assets_redeploy += assets_redeploy
+
+        remaining -= expo_used_total * red_per_eur
 
     status = "OK" if remaining <= 1e-9 else "TARGET_NOT_MET"
     return {
@@ -278,10 +293,10 @@ def greedy_allocate_rwa_reduction(
         "total_exposure_used_eur_bn": total_expo,
         "total_assets_redeploy_used_eur_bn": total_assets_redeploy,
         "remaining_rwa_target_eur_bn": max(0.0, remaining),
-        "ranked_donors": [(d, best[d].receiver, best[d].ratio) for d in ranked],
+        # kept key name for UI compatibility; now it's just donor order with receiver count
+        "ranked_donors": [(d, "MULTI", len(cells_by_donor[d])) for d in B1_DONORS if d in cells_by_donor],
         "status": status,
     }
-
 # Default donor exposure split (since CSV has no subsegment exposures)
 DEFAULT_DONOR_SPLIT_OF_TOTAL_ASSETS = {
     # Segment B donors
@@ -511,7 +526,7 @@ def compute_roe_delta_transitions_greedy(
         # Bank-specific (or overridden) SRT cost in decimal
         sc_i_pre = float(sc.iloc[i]) if hasattr(sc, "iloc") else float(sc)
 
-        alloc_out = greedy_allocate_rwa_reduction(rwa_target_yr, donor_expo, srt_eff_i, sc_i_pre)
+        alloc_out = allocate_rwa_reduction_equal_receivers(rwa_target_yr, donor_expo, srt_eff_i, sc_i_pre)
         achieved = float(alloc_out["total_rwa_reduction_eur_bn"])
         expo_used = float(alloc_out["total_exposure_used_eur_bn"])
         assets_redeploy_used = float(alloc_out["total_assets_redeploy_used_eur_bn"])
@@ -726,34 +741,34 @@ left_col, right_col = st.columns([8, 4], gap="large")
 with right_col:
     st.header("Global Controls")
 
+    # Defaults requested: time horizon starts at 5 years
     years = st.slider("Horizont (Jahre)", min_value=1, max_value=10, value=5, step=1)
 
-    # Filters
-    if "Country" in banks.columns:
-        countries = sorted([c for c in banks["Country"].dropna().unique().tolist()])
-        sel_countries = st.multiselect("Filter: Country", countries, default=countries)
-        banks_f = banks[banks["Country"].isin(sel_countries)].copy()
-    #else:
-    #    banks_f = banks.copy()
+    # No Country/Region filtering for now
+    banks_f = banks.copy()
 
-    if "Region" in banks.columns:
-        regions = sorted([r for r in banks_f["Region"].dropna().unique().tolist()])
-        sel_regions = st.multiselect("Filter: Region", regions, default=regions)
-        banks_f = banks_f[banks_f["Region"].isin(sel_regions)].copy()
+    # Filters (Country/Region) removed as requested
 
     # Bank selection
     bank_list = sorted(banks_f["Bank Name"].unique().tolist())
-    default_sel = bank_list[: min(8, len(bank_list))]
+
+    # Defaults requested: preselect only LBBW and Deutsche Bank (if present in filtered list)
+    preferred_defaults = ["Landesbank Baden-Württemberg", "Deutsche Bank AG"]
+    default_sel = [b for b in preferred_defaults if b in bank_list]
+    if not default_sel:
+        default_sel = bank_list[: min(8, len(bank_list))]
+
     selected_banks = st.multiselect("Banks (toggle on/off)", bank_list, default=default_sel)
 
     st.markdown("---")
     st.subheader("Transition engine controls")
 
-    st.markdown("**SRT-eligible share of donor assets (% of each donor bucket, max 20%)**")
-    avail_sme = st.slider("SME term available for SRT (%)", 0, 20, 20, 1)
-    avail_mid = st.slider("Mid-corp non-IG available for SRT (%)", 0, 20, 20, 1)
-    avail_em = st.slider("EM corporates available for SRT (%)", 0, 20, 20, 1)
-    avail_cre = st.slider("CRE non-HVCRE available for SRT (%)", 0, 20, 20, 1)
+    st.markdown("**SRT-eligible share of donor assets (% of each donor bucket, max 10%)**")
+    # Defaults requested: availability sliders start at 5 (max is still 10)
+    avail_sme = st.slider("SME term available for SRT (%)", 0, 10, 5, 1)
+    avail_mid = st.slider("Mid-corp non-IG available for SRT (%)", 0, 10, 5, 1)
+    avail_em = st.slider("EM corporates available for SRT (%)", 0, 10, 5, 1)
+    avail_cre = st.slider("CRE non-HVCRE available for SRT (%)", 0, 10, 5, 1)
 
     donor_availability_pct = {
         "B1_SME_TERM": float(avail_sme),
@@ -778,7 +793,8 @@ with right_col:
     assets_method = st.radio(
         "Assets offload method",
         ["Simple (RWA density)", "Transition-based (donor RW)"],
-        index=0,
+        # Defaults requested: use Transition-based method by default
+        index=1,
         help=(
             "Simple uses Gross_RWA_Offload converted to assets via bank RWA density. "
             "Transition-based uses the transition engine's achieved RWA reduction per year, "
