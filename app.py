@@ -11,8 +11,8 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import plotly.express as px
-
-
+import plotly.io as pio
+import plotly.graph_objects as go
 # ============================================================
 # Transition matrices + greedy allocator (integrated)
 # ============================================================
@@ -471,6 +471,7 @@ def compute_roe_delta_transitions_greedy(
     sim_df: pd.DataFrame,
     banks_df: pd.DataFrame,
     util: float,
+    apply_util_target_scaling: bool = True,
     override_srt_cost_bp: float | None = None,
     override_tax_rate: float | None = None,
     donor_split_override_by_bank: Optional[Dict[str, Dict[str, float]]] = None,
@@ -527,13 +528,36 @@ def compute_roe_delta_transitions_greedy(
     exposure_used_yr = []
     assets_redeploy_used_yr = []
     status_list = []
+    rwa_target_base_yr_list = []
+    rwa_target_scaled_yr_list = []
+    rwa_target_scale_list = []
 
     # audit trail (optional)
     audit_rows: List[Dict[str, object]] = []
 
     for i, row in df.iterrows():
         bank = row["Bank"]
-        rwa_target_yr = float(eff_per_year[i]) if np.isfinite(eff_per_year[i]) else 0.0
+        # Base (effective) annual RWA reduction target
+        rwa_target_yr_base = float(eff_per_year[i]) if np.isfinite(eff_per_year[i]) else 0.0
+
+        # Scale the allocator target by the global "Redeployment / CET1-Split (%)" slider.
+        # Requested factor: (1/(1-slider) - 1) where slider is a DECIMAL in [0, 1].
+        # This equals slider/(1-slider). We guard against slider=1.
+        if apply_util_target_scaling:
+            util_dec = float(util) if util is not None else 0.0
+            if not np.isfinite(util_dec):
+                util_dec = 0.0
+            util_dec = max(min(util_dec, 0.999999), 0.0)
+            target_scale = (1.0 / (1.0 - util_dec)) - 1.0  # = util_dec/(1-util_dec)
+            rwa_target_yr = rwa_target_yr_base * target_scale
+        else:
+            target_scale = 1.0
+            rwa_target_yr = rwa_target_yr_base
+
+        # store targets for reporting (aligned with df rows)
+        rwa_target_base_yr_list.append(rwa_target_yr_base)
+        rwa_target_scaled_yr_list.append(rwa_target_yr)
+        rwa_target_scale_list.append(target_scale)
 
         total_assets_bn = float(assets_total.get(bank, np.nan))
         if not np.isfinite(total_assets_bn) or total_assets_bn <= 0:
@@ -607,7 +631,9 @@ def compute_roe_delta_transitions_greedy(
         for a in alloc_out["allocations"]:
             # delta_s_eff_dec is precomputed in the allocator using:
             #   (-ΔRWA_pp)/100 * SRT_efficiency * (abs net spread of receiver) - 2 * SRT_cost
-            contrib = a.exposure_used_eur_bn * a.delta_s_eff_dec * (1.0 - tx_i) * float(util)
+            # NOTE: 'util' (Redeployment / CET1-Split slider) now only affects the *target volume*
+            # via RWA_target_scaled_EUR_bn_Yr. It should NOT additionally scale profits.
+            contrib = a.exposure_used_eur_bn * a.delta_s_eff_dec * (1.0 - tx_i)
             profit += contrib
 
             audit_rows.append({
@@ -615,6 +641,8 @@ def compute_roe_delta_transitions_greedy(
                 "Scenario": row["Scenario"],
                 "SRT_Efficiency": row["SRT_Efficiency"],
                 "Years": int(row["Years"]),
+                "RWA_target_base_EUR_bn_Yr": rwa_target_yr_base,
+                "RWA_target_scaled_EUR_bn_Yr": rwa_target_yr,
                 "Donor": a.donor,
                 "Receiver": a.receiver,
                 "Exposure_used_EUR_bn_Yr": a.exposure_used_eur_bn,
@@ -634,6 +662,9 @@ def compute_roe_delta_transitions_greedy(
         status_list.append(status)
 
     df["RWA_reduction_achieved_Yr"] = rwa_red_yr_achieved
+    df["RWA_target_base_Yr"] = rwa_target_base_yr_list
+    df["RWA_target_scaled_Yr"] = rwa_target_scaled_yr_list
+    df["RWA_target_scale"] = rwa_target_scale_list
     df["Assets_redeploy_used_Yr"] = assets_redeploy_used_yr  # receiver-side assets redeployed (implied by receiver risk weights)
     df["Addl_profit_Yr"] = addl_profit_yr
     df["Transition_status"] = status_list
@@ -756,9 +787,10 @@ def make_portfolio_row(banks_sel: pd.DataFrame) -> pd.DataFrame:
 # ---------------- Streamlit App ----------------
 # ============================================================
 st.set_page_config(page_title="Bank-specific Offload Simulation", layout="wide")
-st.title("Bank-specific Offload Simulation")
 
-# ---- Load bank input data automatically ----
+
+
+
 DATA_PATH = "52_banks_full_results.csv"
 
 try:
@@ -789,29 +821,80 @@ if missing:
 banks = banks.copy()
 banks["Bank Name"] = banks["Bank Name"].astype(str)
 
-# ---- Main layout: charts left, controls right ----
-left_col, right_col = st.columns([8, 4], gap="large")
 
-with right_col:
-    st.header("Global Controls")
 
-    # Defaults requested: time horizon starts at 5 years
-    years = st.slider("Time horizon (years)", min_value=1, max_value=10, value=5, step=1)
+# Build bank list (used by bank toggles)
+bank_list = sorted(banks["Bank Name"].dropna().astype(str).unique().tolist())
 
-    # No Country/Region filtering for now
-    banks_f = banks.copy()
+# ---------------- Top controls header (3 columns) ----------------
+# Controls previously in the right "sidebar" column are now rendered in a dashboard-style header.
+import itertools
 
-    # Filters (Country/Region) removed as requested
+# Add subtle vertical separators between the three top-control columns.
+# Implementation note: CSS targeting Streamlit's generated DOM can be brittle across versions.
+# We therefore insert two narrow "separator" columns between the three control columns.
 
-    # Bank selection
-    bank_list = sorted(banks_f["Bank Name"].unique().tolist())
+_SEPARATOR_STYLE = "border-left: 1px solid rgba(49, 51, 63, 0.20); height: 900px; margin: 0 auto;"
 
-    # Defaults requested: preselect only LBBW and Deutsche Bank (if present in filtered list)
-    preferred_defaults = ["Landesbank Baden-Württemberg", "Deutsche Bank AG"]
-    default_sel = [b for b in preferred_defaults if b in bank_list]
-    if not default_sel:
-        default_sel = bank_list[: min(8, len(bank_list))]
-    # Per-bank toggles (multiple banks can be selected)
+def _draw_vsep():
+    # Large height ensures the line spans the full height of the controls area.
+    st.markdown(f"<div style='{_SEPARATOR_STYLE}'></div>", unsafe_allow_html=True)
+
+class _RoundRobinControls:
+    def __init__(self, cols):
+        self._cols = cols
+        self._it = itertools.cycle(range(len(cols)))
+
+    def _next_col(self):
+        return self._cols[next(self._it)]
+
+    def __getattr__(self, name):
+        col = self._next_col()
+        attr = getattr(col, name)
+        if callable(attr):
+            def _wrapped(*args, **kwargs):
+                return attr(*args, **kwargs)
+            return _wrapped
+        return attr
+
+_top_controls_container = st.container()
+with _top_controls_container:
+    # Use 5 columns (3 control columns + 2 thin separator columns). Keep gaps small so
+    # the 3 control columns retain enough width for sliders/toggles.
+    _tc1, _sep1, _tc2, _sep2, _tc3 = st.columns([1, 0.02, 1, 0.02, 1], gap="small")
+    with _sep1:
+        _draw_vsep()
+    with _sep2:
+        _draw_vsep()
+
+top_controls = _RoundRobinControls([_tc1, _tc2, _tc3])
+top_controls.header("Global Controls")
+
+with _tc1:
+    # Time horizon — moved above Scenario
+    years = st.slider(
+        "Time horizon (years)",
+        min_value=1,
+        max_value=10,
+        value=5,
+        step=1,
+    )
+
+    st.markdown("---")
+
+    st.subheader("Scenario (US advantage in bps)")
+    scenario_bps = st.slider(
+        "US advantage (bp)",
+        min_value=0,
+        max_value=400,
+        value=168,
+        step=5,
+    )
+
+    st.markdown("---")
+
+
+with _tc1:
     st.caption("Select one or more banks:")
 
     def _safe_bank_key(name: str) -> str:
@@ -835,65 +918,70 @@ with right_col:
 
     st.session_state["selected_banks"] = selected_banks
 
-    st.markdown("---")
 
-    st.subheader("Complex module (ΔROE)")
+
+# ------------------------------------------------------------
+# Consistent legend + colors across charts (by Bank)
+# ------------------------------------------------------------
+# Keep a stable order for legend items (use the sidebar order)
+BANK_ORDER = [b for b in bank_list if b in selected_banks]
+
+# Use the active Plotly template colorway (matches PX defaults)
+BANK_COLOR_SEQ = list(getattr(pio.templates[pio.templates.default].layout, "colorway", []))
+if not BANK_COLOR_SEQ:
+    BANK_COLOR_SEQ = px.colors.qualitative.Plotly
+
+# Deterministic mapping: Bank -> color, in BANK_ORDER
+BANK_COLOR_MAP = {b: BANK_COLOR_SEQ[i % len(BANK_COLOR_SEQ)] for i, b in enumerate(BANK_ORDER)}
+
+
+
+# Defaults requested: time horizon starts at 5 years
+
+# No Country/Region filtering for now
+banks_f = banks.copy()
+
+# Filters (Country/Region) removed as requested
+
+# Bank selection
+bank_list = sorted(banks_f["Bank Name"].unique().tolist())
+
+# Defaults requested: preselect only LBBW and Deutsche Bank (if present in filtered list)
+preferred_defaults = ["Landesbank Baden-Württemberg", "Deutsche Bank AG"]
+default_sel = [b for b in preferred_defaults if b in bank_list]
+if not default_sel:
+    default_sel = bank_list[: min(8, len(bank_list))]
+# Per-bank toggles (multiple banks can be selected)
+top_controls.markdown("---")
+
+
+override = top_controls.checkbox("Override bank-specific cost/tax with global values", value=False)
+override_srt_cost_bp = override_tax_rate = None
+if override:
+    override_srt_cost_bp = top_controls.slider("Global SRT Cost (bp)", 0, 100, 20, 5)
+    override_tax_rate = top_controls.slider("Global Tax rate (%)", 0, 50, 25, 1) / 100.0
+
+
+
+
+with _tc2:
+    # Redeployment / CET1-Split — moved to top of middle column
     util = st.slider(
         "Redeployment / CET1-Split (%)",
-        min_value=50,
+        min_value=0,
         max_value=100,
-        value=85,
+        value=50,
         step=1,
         help="Defines how RWAs freed by offloading are used. 100% means 100% of freed RWAs are redeployed into new assets and 0% go to CET1 uplift. 0% means 0% are redeployed and 100% go to CET1 uplift. Intermediate values split proportionally.",
     ) / 100.0
 
-    override = st.checkbox("Override bank-specific cost/tax with global values", value=False)
-    override_srt_cost_bp = override_tax_rate = None
-    if override:
-        override_srt_cost_bp = st.slider("Global SRT Cost (bp)", 0, 100, 20, 5)
-        override_tax_rate = st.slider("Global Tax rate (%)", 0, 50, 25, 1) / 100.0
-
-
-
-    st.subheader("Transition engine controls")
-
-    st.markdown("**SRT-eligible share of donor assets (% of each donor bucket, max 10%)**")
-    # Defaults requested: availability sliders start at 5 (max is still 10)
-    avail_sme = st.slider("SME term available for SRT (%)", 0, 10, 5, 1)
-    avail_mid = st.slider("Mid-corp non-IG available for SRT (%)", 0, 10, 5, 1)
-    avail_em = st.slider("EM corporates available for SRT (%)", 0, 10, 5, 1)
-    avail_cre = st.slider("CRE non-HVCRE available for SRT (%)", 0, 10, 5, 1)
-
-    donor_availability_pct = {
-        "B1_SME_TERM": float(avail_sme),
-        "B1_MIDCORP_NONIG": float(avail_mid),
-        "B1_EM_CORP": float(avail_em),
-        "B1_CRE_NON_HVCRE": float(avail_cre),
-    }
-
-    # Optional per-bank donor split override (not used unless you add controls for it)
-    donor_split_override = None
-
-    # Sidebar toggles removed as requested
-    require_exact = False
-    tol_pct = st.slider("Target tolerance (%)", 0.0, 5.0, 0.5, 0.1)
-
-    show_audit = False
-
-    # Placeholder for capacity indicator (filled after model run)
-    capacity_placeholder = st.empty()
-
     st.markdown("---")
-    st.subheader("Offload Display")
 
-    # Offload Display toggles removed as requested (fixed defaults)
-    metric = "Assets (EUR bn)"
-    agg = "Total (Horizont)"
+    st.subheader("Offload Display")
 
     assets_method = st.radio(
         "Assets offload method",
         ["Simple (RWA density)", "Transition-based (donor RW)"],
-        # Defaults requested: use Transition-based method by default
         index=1,
         help=(
             "Simple uses Gross_RWA_Offload converted to assets via bank RWA density. "
@@ -902,19 +990,62 @@ with right_col:
         ),
     )
 
-    st.markdown("---")
-    st.subheader("Scenario (US advantage in bps)")
 
-    # Single-scenario setup (replaces the former S1/S2/S3/Custom set)
-    scenario_bps = st.slider("US advantage (bp)", 0, 400, 168, 5)
-
-    st.subheader("SRT efficiencies")
-
-    # Single SRT efficiency (replaces A/B/C/D sliders)
-    srt_eff = st.slider("SRT efficiency", 0.0, 1.0, 0.75, 0.01)
+    
 
 
-    st.markdown("---")
+
+
+with _tc3:
+    st.subheader("Transition engine controls")
+
+    st.markdown("**SRT-eligible share of donor assets (% of each donor bucket, max 10%)**")
+    # Defaults requested: availability sliders start at 5 (max is still 10)
+    avail_sme = st.slider("SME term available for SRT (%)", 0, 10, 5, 1, key="avail_sme")
+    avail_mid = st.slider("Mid-corp non-IG available for SRT (%)", 0, 10, 5, 1, key="avail_mid")
+    avail_em = st.slider("EM corporates available for SRT (%)", 0, 10, 5, 1, key="avail_em")
+    avail_cre = st.slider("CRE non-HVCRE available for SRT (%)", 0, 10, 5, 1, key="avail_cre")
+
+
+donor_availability_pct = {
+    "B1_SME_TERM": float(avail_sme),
+    "B1_MIDCORP_NONIG": float(avail_mid),
+    "B1_EM_CORP": float(avail_em),
+    "B1_CRE_NON_HVCRE": float(avail_cre),
+}
+
+# Optional per-bank donor split override (not used unless you add controls for it)
+donor_split_override = None
+
+# Sidebar toggles removed as requested
+require_exact = False
+tol_pct = top_controls.slider("Target tolerance (%)", 0.0, 5.0, 0.5, 0.1)
+
+show_audit = False
+
+# Placeholder for capacity indicator (filled after model run)
+capacity_placeholder = st.empty()
+
+
+# Offload Display toggles removed as requested (fixed defaults)
+metric = "Assets (EUR bn)"
+agg = "Total (Horizont)"
+
+
+top_controls.markdown("---")
+top_controls.markdown("---")
+# Single SRT efficiency (replaces A/B/C/D sliders)
+top_controls.subheader("SRT efficiencies")
+
+srt_eff = top_controls.slider(
+    "SRT efficiency",
+    0.0,
+    1.0,
+    0.75,
+    0.01,
+)
+top_controls.markdown("---")
+
 # Validate selections
 if not selected_banks:
     st.error("Please select at least one bank in the sidebar.")
@@ -935,6 +1066,20 @@ roe_port = compute_roe_delta_transitions_greedy(
     sim_port,
     portfolio_df,
     util=util,
+    apply_util_target_scaling=True,
+    override_srt_cost_bp=override_srt_cost_bp,
+    override_tax_rate=override_tax_rate,
+    require_exact_target=require_exact,
+    target_tolerance_pct=tol_pct,
+    donor_availability_pct_by_donor=donor_availability_pct,
+)
+
+# Base (unscaled) allocator run for chart (1) base bars
+roe_port_base = compute_roe_delta_transitions_greedy(
+    sim_port,
+    portfolio_df,
+    util=util,
+    apply_util_target_scaling=False,
     override_srt_cost_bp=override_srt_cost_bp,
     override_tax_rate=override_tax_rate,
     require_exact_target=require_exact,
@@ -949,6 +1094,20 @@ roe_df = compute_roe_delta_transitions_greedy(
     sim_df,
     banks_sel,
     util=util,
+    apply_util_target_scaling=True,
+    override_srt_cost_bp=override_srt_cost_bp,
+    override_tax_rate=override_tax_rate,
+    require_exact_target=require_exact,
+    target_tolerance_pct=tol_pct,
+    donor_availability_pct_by_donor=donor_availability_pct,
+)
+
+# Base (unscaled) allocator run for chart (1) base bars
+roe_df_base = compute_roe_delta_transitions_greedy(
+    sim_df,
+    banks_sel,
+    util=util,
+    apply_util_target_scaling=False,
     override_srt_cost_bp=override_srt_cost_bp,
     override_tax_rate=override_tax_rate,
     require_exact_target=require_exact,
@@ -958,7 +1117,46 @@ roe_df = compute_roe_delta_transitions_greedy(
 sri_df = compute_sri(sim_df, banks_sel)
 
 
+# ============================================================
+# Sidebar capacity indicator (lights up when target not met)
+# ============================================================
+def _is_insufficient_transition(status: object) -> bool:
+    """Return True if the transition engine could not meet the annual RWA target."""
+    s = str(status) if status is not None else ""
+    if s == "OK":
+        return False
+    # Anything else implies infeasibility / non-compliance with target (incl. tolerance / exact).
+    return True
 
+
+insufficient_rows = roe_df[roe_df["Transition_status"].apply(_is_insufficient_transition)]
+insufficient_rows_port = roe_port[roe_port["Transition_status"].apply(_is_insufficient_transition)]
+insufficient_any = (not insufficient_rows.empty) or (not insufficient_rows_port.empty)
+
+with capacity_placeholder.container():
+    top_controls.markdown("---")
+    top_controls.subheader("SRT Capacity Check")
+
+    if insufficient_any:
+        st.error("🚨 Insufficient SRT-eligible assets: target annual RWA reduction cannot be met for all combinations.")
+        top_controls.caption(
+            "Reduce the risk by increasing donor availability sliders or relaxing the target tolerance/exactness settings."
+        )
+
+        # A button-like interaction to reveal details
+        if st.button("Show failing combinations"):
+            cols = [
+                "Bank",
+                "Scenario",
+                "SRT_Efficiency",
+                "Years",
+                "Transition_status",
+                "RWA_reduction_achieved_Yr",
+            ]
+            st.dataframe(insufficient_rows[cols], use_container_width=True, height=240)
+            st.dataframe(insufficient_rows_port[cols], use_container_width=True, height=160)
+    else:
+        top_controls.success("✅ Capacity sufficient: target annual RWA reduction is achievable for all displayed combinations.")
 
 # ---- Optional alternative assets-offload measure (transition-based) ----
 def _attach_transition_based_assets(sim: pd.DataFrame, roe: pd.DataFrame) -> pd.DataFrame:
@@ -1030,13 +1228,47 @@ def _attach_transition_based_assets(sim: pd.DataFrame, roe: pd.DataFrame) -> pd.
     return sim
 
 
-sim_df = _attach_transition_based_assets(sim_df, roe_df)
-sim_port = _attach_transition_based_assets(sim_port, roe_port)
+sim_df = _attach_transition_based_assets(sim_df, roe_df_base)
+sim_port = _attach_transition_based_assets(sim_port, roe_port_base)
 
  
 # ============================================================
 # Charts
 # ============================================================
+
+# ---------------- Top controls (formerly sidebar) ----------------
+# Render controls in a true horizontal "header" layout (3 columns).
+import itertools
+
+class _RoundRobinControls:
+    def __init__(self, cols):
+        self._cols = cols
+        self._it = itertools.cycle(range(len(cols)))
+
+    def _next_col(self):
+        return self._cols[next(self._it)]
+
+    def __getattr__(self, name):
+        col = self._next_col()
+        attr = getattr(col, name)
+        if callable(attr):
+            def _wrapped(*args, **kwargs):
+                return attr(*args, **kwargs)
+            return _wrapped
+        return attr
+
+top_controls_container = st.container()
+with top_controls_container:
+    _c1, _c2, _c3 = st.columns(3, gap="large")
+
+top_controls = _RoundRobinControls([_c1, _c2, _c3])
+st.title("Bank-specific Offload Simulation")
+
+# ---- Load bank input data automatically ----
+# ---- Main layout: charts left, controls right ----
+left_col = st.container()  # charts area (controls moved to top header)
+
+
 with left_col:
     # Place "1) Offload (Simple)" and "2) Offload Complex (ΔROE)" side by side
     c1, c2 = st.columns(2, gap="large")
@@ -1048,30 +1280,95 @@ with left_col:
         yv_simple = "Assets_Offloaded_Transition_EUR_bn_Tot"
         yl_simple = "Assets offloaded (EUR bn, total, transition-based)"
 
-        fig1 = px.bar(
-            sim_df,
-            x="Bank",
-            y=yv_simple,
-            color="Bank",
-            barmode="group",
-            labels={yv_simple: yl_simple,  "Bank": "Bank"},
-            title="Required offload (transition-based assets)"
+        # --- Redeployment / CET1-Split slider effect on simple offload chart ---
+        # We stack an additional bar segment on top of each bank's base bar.
+        # Factor requested: base * (util/(1-util)). Example util=75% => factor=3x.
+        if util >= 1.0:
+            st.warning("Redeployment is set to 100%. The stacked factor becomes undefined (division by zero). Using 99.9% for display.")
+        _util_disp = min(float(util), 0.999)
+        _factor = _util_disp / (1.0 - _util_disp)  # == (1/(1-util) - 1)
+
+        # Build a stacked-bar figure where each bank is its own offsetgroup so stacks don't mix across banks.
+        fig1 = go.Figure()
+
+        # Keep stable ordering for x
+        scenarios_order = sim_df["Scenario"].astype(str).dropna().unique().tolist()
+
+        for bank in BANK_ORDER:
+            d = sim_df[sim_df["Bank"] == bank]
+            if d.empty:
+                continue
+            # Map scenario -> base value
+            base_map = {str(r["Scenario"]): float(r.get(yv_simple, 0.0) or 0.0) for _, r in d.iterrows()}
+            base_vals = [base_map.get(str(sc), 0.0) for sc in scenarios_order]
+            top_vals = [v * _factor for v in base_vals]
+
+            color = BANK_COLOR_MAP.get(bank)
+
+            # Base (old) bar
+            fig1.add_trace(
+                go.Bar(
+                    name=bank,
+                    x=scenarios_order,
+                    y=base_vals,
+                    marker_color=color,
+                    offsetgroup=bank,
+                    legendgroup=bank,
+                    showlegend=True,
+                )
+            )
+
+            # Stacked top segment (new)
+            fig1.add_trace(
+                go.Bar(
+                    name=f"{bank} (redeployment)",
+                    x=scenarios_order,
+                    y=top_vals,
+                    marker_color=color,
+                    marker_opacity=0.35,
+                    offsetgroup=bank,
+                    legendgroup=bank,
+                    showlegend=False,
+                )
+            )
+
+        fig1.update_layout(
+            barmode="stack",
+            title="Required offload (transition-based assets) + redeployment stack",
+            legend_title_text="Bank",
+            legend_orientation="v",
+            legend_yanchor="top",
+            legend_y=1,
+            legend_xanchor="left",
+            legend_x=1.02,
         )
+        fig1.update_yaxes(title_text=yl_simple)
+        fig1.update_xaxes(title_text="")
+
         st.plotly_chart(fig1, use_container_width=True)
     with c2:
         st.subheader("2) Offload Complex (ΔROE)")
 
         fig2 = px.bar(
             roe_df,
-            x="Bank",
+            x="Scenario",
             y="ROE_delta_bp",
             color="Bank",
             barmode="group",
-            labels={"ROE_delta_bp": "ΔROE (bp p.a.)",  "Bank": "Bank"},
+            category_orders={"Bank": BANK_ORDER},
+            color_discrete_map=BANK_COLOR_MAP,
+            labels={"ROE_delta_bp": "ΔROE (bp p.a.)", "Scenario": "", "Bank": "Bank"},
             title="ΔROE (bp p.a.) – Banks (transition-based)"
         )
+        fig2.update_layout(
+            legend_title_text="Bank",
+            legend_orientation="v",
+            legend_yanchor="top",
+            legend_y=1,
+            legend_xanchor="left",
+            legend_x=1.02,
+        )
         st.plotly_chart(fig2, use_container_width=True)
-
     st.markdown("---")
 
     # ---- Donor utilization (how much of eligible donor assets are used) ----
@@ -1136,12 +1433,20 @@ with left_col:
             y="Utilization_pct_Yr",
             color="Bank",
             barmode="group",
+            category_orders={"Bank": BANK_ORDER},
+            color_discrete_map=BANK_COLOR_MAP,
             labels={"Utilization_pct_Yr": "Utilization (% of eligible per year)", "Donor": "Donor bucket", "Bank": "Bank"},
         )
         fig_util.update_yaxes(range=[0, 100])
+        fig_util.update_layout(
+            legend_title_text="Bank",
+            legend_orientation="v",
+            legend_yanchor="top",
+            legend_y=1,
+            legend_xanchor="left",
+            legend_x=1.02,
+        )
         st.plotly_chart(fig_util, use_container_width=True)
-
-
     st.markdown("---")
     st.subheader("PORTFOLIO (aggregate across selected banks)")
 
@@ -1155,10 +1460,9 @@ with left_col:
         y=yv,
         color="SRT_Efficiency",
         barmode="group",
-        labels={yv: yl,  "SRT_Efficiency": "SRT-Efficiency"},
+        labels={yv: yl, "Scenario": "", "SRT_Efficiency": "SRT-Efficiency"},
         title="Required Offload – Portfolio"
     )
-    st.plotly_chart(figP1, use_container_width=True)
 
     figP2 = px.bar(
         roe_port,
@@ -1166,10 +1470,15 @@ with left_col:
         y="ROE_delta_bp",
         color="SRT_Efficiency",
         barmode="group",
-        labels={"ROE_delta_bp": "ΔROE (bp p.a.)",  "SRT_Efficiency": "SRT-Efficiency"},
+        labels={"ROE_delta_bp": "ΔROE (bp p.a.)", "Scenario": "", "SRT_Efficiency": "SRT-Efficiency"},
         title="ΔROE (bp p.a.) – Portfolio (transition-based)"
     )
-    st.plotly_chart(figP2, use_container_width=True)
+
+    pcol1, pcol2 = st.columns(2, gap="large")
+    with pcol1:
+        st.plotly_chart(figP1, use_container_width=True)
+    with pcol2:
+        st.plotly_chart(figP2, use_container_width=True)
 
 
 # ---- XLSX Export ----
