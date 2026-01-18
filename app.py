@@ -78,7 +78,6 @@ ABS_NET_SPREAD_BPS_BY_B2: Dict[str, float] = {
 }
 
 
-
 @dataclass(frozen=True)
 class Cell:
     donor: str
@@ -103,7 +102,6 @@ class Allocation:
     abs_net_spread_bps: float
     delta_s_eff_dec: float
     ratio: float
-
 
 
 # Risk weights used for the transition engine
@@ -866,8 +864,6 @@ def make_portfolio_row(banks_sel: pd.DataFrame) -> pd.DataFrame:
 st.set_page_config(page_title="Bank-specific Offload Simulation", layout="wide")
 
 
-
-
 DATA_PATH = "52_banks_full_results.csv"
 
 try:
@@ -897,7 +893,6 @@ if missing:
 # Clean / ensure types
 banks = banks.copy()
 banks["Bank Name"] = banks["Bank Name"].astype(str)
-
 
 
 # Build bank list (used by bank toggles)
@@ -1009,7 +1004,6 @@ with _tc1:
     st.session_state["selected_banks"] = selected_banks
 
 
-
 # ------------------------------------------------------------
 # Consistent legend + colors across charts (by Bank)
 # ------------------------------------------------------------
@@ -1023,7 +1017,6 @@ if not BANK_COLOR_SEQ:
 
 # Deterministic mapping: Bank -> color, in BANK_ORDER
 BANK_COLOR_MAP = {b: BANK_COLOR_SEQ[i % len(BANK_COLOR_SEQ)] for i, b in enumerate(BANK_ORDER)}
-
 
 
 # Defaults requested: time horizon starts at 5 years
@@ -1047,9 +1040,6 @@ if not default_sel:
 override_srt_cost_bp = override_tax_rate = None
 
 
-
-
-
 with _tc2:
     st.subheader("SRT efficiencies")
 
@@ -1063,29 +1053,12 @@ with _tc2:
         key="srt_eff_slider",
     )
     st.markdown("---")
-
-    st.subheader("Offload Display")
-
-    assets_method = st.radio(
-        "Assets offload method",
-        ["Simple (RWA density)", "Transition-based (donor RW)"],
-        index=1,
-        help=(
-            "Simple uses Gross_RWA_Offload converted to assets via bank RWA density. "
-            "Transition-based uses the transition engine's achieved RWA reduction per year, "
-            "converted to assets via the receiver risk weights and summed across contributions."
-        ),
-    )
-
     # Bank-level capacity indicator placeholder (filled later after simulation)
     st.markdown("**Capacity indicator (eligible donor RWAs)**")
     bank_capacity_placeholder = st.container()
 
 
-
     
-
-
 
 
 with _tc3:
@@ -1117,7 +1090,6 @@ with _tc3:
     )
 
 
-
 donor_availability_pct = {
     "B1_SME_TERM": float(avail_sme),
     "B1_MIDCORP_NONIG": float(avail_mid),
@@ -1135,7 +1107,6 @@ tol_pct = 0.5
 show_audit = False
 
 # Placeholder for capacity indicator (filled after model run)
-
 
 
 # Offload Display toggles removed as requested (fixed defaults)
@@ -1217,9 +1188,6 @@ roe_df_base = compute_roe_delta_transitions_greedy(
     donor_availability_pct_by_donor=donor_availability_pct,
 )
 sri_df = compute_sri(sim_df, banks_sel)
-
-
-
 
 
 # ---- Optional alternative assets-offload measure (transition-based) ----
