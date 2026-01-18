@@ -6,6 +6,9 @@ from typing import Dict, Tuple, List, Optional
 # Global constant: total assets column name
 TOTAL_ASSETS_COL = "Total Assets (EUR bn)"
 
+# Fallback SRT cost used by the model (input CSV values are ignored; overridden via UI slider).
+DEFAULT_SRT_COST_PCT = 0.2  # percent (0.2% = 20 bps)
+
 
 import numpy as np
 import pandas as pd
@@ -126,6 +129,7 @@ def _eligible_cells_by_donor(
     srt_cost_dec: float,
     delta_rwa_pp: Dict[Tuple[str, str], float],
     delta_spread_bps: Dict[Tuple[str, str], float],
+    donor_availability_pct_by_donor: Optional[Dict[str, float]] = None,
 ) -> Dict[str, List[Cell]]:
     """Return all *eligible* receiver cells per donor.
 
@@ -165,7 +169,19 @@ def _eligible_cells_by_donor(
 
         # economics term (bps -> decimal)
         srt_cost_bp = float(srt_cost_dec) * 10000.0
-        delta_s_eff_bps = delta_rwa_density * eff * abs_spread_bps - 2.0 * srt_cost_bp
+        # NEW: Adjust SRT cost by the donor's SRT-eligible share of donor assets (slider, in %).
+        # For each donor->receiver cell, we divide the cost by the eligible share (as a decimal).
+        # Example: 5% eligible share -> divide by 0.05 -> higher effective cost for scarce eligibility.
+        elig_share_dec = 1.0
+        if donor_availability_pct_by_donor and d in donor_availability_pct_by_donor:
+            try:
+                elig_share_dec = float(donor_availability_pct_by_donor.get(d, 100.0)) / 100.0
+            except Exception:
+                elig_share_dec = 1.0
+        elig_share_dec = max(elig_share_dec, 1e-6)
+        srt_cost_bp_adj = srt_cost_bp / elig_share_dec
+        # Effective spread term (bps). Note: SRT cost is applied once (no factor 2).
+        delta_s_eff_bps = delta_rwa_density * eff * abs_spread_bps - 1.0 * srt_cost_bp_adj
         delta_s_eff_dec = delta_s_eff_bps / 10000.0
 
         rwa_red_per_eur = donor_rw * eff
@@ -193,6 +209,7 @@ def allocate_rwa_reduction_equal_receivers(
     donor_exposure_eur_bn: Dict[str, float],
     srt_efficiency: float,
     srt_cost_dec: float,
+    donor_availability_pct_by_donor: Optional[Dict[str, float]] = None,
 ) -> Dict[str, object]:
     """Allocator (Segment B only) with *equal split across eligible receivers*.
 
@@ -214,6 +231,7 @@ def allocate_rwa_reduction_equal_receivers(
         srt_cost_dec=float(srt_cost_dec),
         delta_rwa_pp=DELTA_RWA_PP_B,
         delta_spread_bps=DELTA_SPREAD_BPS_B,
+        donor_availability_pct_by_donor=donor_availability_pct_by_donor,
     )
 
     if not cells_by_donor:
@@ -492,16 +510,17 @@ def compute_roe_delta_transitions_greedy(
     bmap = banks_df.set_index("Bank Name")
 
     # Per-bank parameter maps
-    srt_cost_pct = bmap["SRT Cost (%)"].to_dict()
+    # NOTE: SRT cost supplied via CSV is intentionally ignored (controlled via UI slider).
     tax_pct = bmap["Effective Tax Rate (%)"].to_dict()
     assets_total = bmap["Total Assets (EUR bn)"].to_dict()
 
-    DEFAULT_SRT_COST = 0.2  # percent
+    DEFAULT_SRT_COST = DEFAULT_SRT_COST_PCT  # percent
 
     df = sim_df.copy()
 
-    # SRT cost and tax series (bank-specific unless overridden)
-    sc = (df["Bank"].map(srt_cost_pct).fillna(DEFAULT_SRT_COST) / 100.0)  # decimal
+    # SRT cost and tax series
+    # SRT cost: constant fallback (CSV ignored) unless overridden via slider.
+    sc = np.full(len(df), float(DEFAULT_SRT_COST) / 100.0, dtype=float)  # decimal
     tx = (df["Bank"].map(tax_pct).fillna(0.0) / 100.0)  # decimal
 
     if override_srt_cost_bp is not None:
@@ -616,7 +635,8 @@ def compute_roe_delta_transitions_greedy(
         # Step 1: Redeployment allocation
         # ------------------------------
         alloc_redeploy = allocate_rwa_reduction_equal_receivers(
-            rwa_target_redeploy_yr, donor_expo, srt_eff_i, sc_i_pre
+            rwa_target_redeploy_yr, donor_expo, srt_eff_i, sc_i_pre,
+            donor_availability_pct_by_donor=donor_availability_pct_by_donor
         )
 
         achieved_redeploy = float(alloc_redeploy["total_rwa_reduction_eur_bn"])
@@ -638,7 +658,8 @@ def compute_roe_delta_transitions_greedy(
         # Step 2: CET1 uplift allocation
         # ------------------------------
         alloc_cet1 = allocate_rwa_reduction_equal_receivers(
-            rwa_target_cet1_yr, donor_expo_remaining, srt_eff_i, sc_i_pre
+            rwa_target_cet1_yr, donor_expo_remaining, srt_eff_i, sc_i_pre,
+            donor_availability_pct_by_donor=donor_availability_pct_by_donor
         )
 
         achieved_cet1 = float(alloc_cet1["total_rwa_reduction_eur_bn"])
@@ -801,7 +822,8 @@ def make_portfolio_row(banks_sel: pd.DataFrame) -> pd.DataFrame:
 
     # Fallbacks for sparse columns (per-bank first)
     df["Net Spread (%)"] = df["Net Spread (%)"].fillna(2.5)
-    df["SRT Cost (%)"] = df["SRT Cost (%)"].fillna(0.2)
+    # SRT cost values from the CSV are not used by the model; keep a consistent fallback for display.
+    df["SRT Cost (%)"] = df["SRT Cost (%)"].fillna(DEFAULT_SRT_COST_PCT)
     df["Effective Tax Rate (%)"] = df["Effective Tax Rate (%)"].fillna(0.0)
 
     # CET1 capital per bank (bn EUR)
@@ -824,6 +846,7 @@ def make_portfolio_row(banks_sel: pd.DataFrame) -> pd.DataFrame:
         return float(np.nansum(x * w) / wsum) if wsum > 0 else np.nan
 
     spread_pct = wavg(df["Net Spread (%)"].to_numpy())
+    # Display-only (model uses the SRT cost slider).
     srt_cost_pct = wavg(df["SRT Cost (%)"].to_numpy())
     tax_pct = wavg(df["Effective Tax Rate (%)"].to_numpy())
 
@@ -957,7 +980,7 @@ with _tc1:
     st.subheader("Scenario (US advantage in bps)")
     scenario_bps = st.slider(
         "US advantage (bp)",
-        min_value=0,
+        min_value=1,
         max_value=400,
         value=168,
         step=1,
@@ -967,10 +990,9 @@ with _tc1:
     
 
     # Redeployment / CET1-Split — moved below US advantage in left column
-    util = st.slider(
-        "Redeployment / CET1-Split (%)",
+    util = st.slider("Redeployment / CET1-Split (%)",
         min_value=0.0,
-        max_value=100.0,
+        max_value=99.9,
         value=50.0,
         step=0.1,
         format="%.1f",
@@ -1041,7 +1063,7 @@ override_srt_cost_bp = override_tax_rate = None
 
 
 with _tc2:
-    st.subheader("SRT efficiencies")
+    st.subheader("SRT Efficiency/ Cost")
 
     srt_eff = st.slider(
         "SRT efficiency",
@@ -1051,6 +1073,21 @@ with _tc2:
         step=0.01,
         help="Share of RWA relief in a significant risk transfer (SRT) recognized by regulator",
         key="srt_eff_slider",
+    )
+
+    # SRT cost is controlled via slider (CSV-supplied SRT Cost (%) is ignored).
+    # SRT cost slider (0–15 bps, default 2 bps)
+    override_srt_cost_bp = st.slider(
+        "SRT cost (bps)",
+        min_value=0,
+        max_value=15,
+        value=2,
+        step=1,
+        help=(
+            "SRT cost in basis points. This slider overrides/ignores any SRT Cost (%) values "
+            "supplied via the CSV. Default is 2× the model fallback cost."
+        ),
+        key="srt_cost_bps_slider",
     )
     st.markdown("---")
     # Bank-level capacity indicator placeholder (filled later after simulation)
@@ -1691,6 +1728,36 @@ with left_col:
                     max_adv_map[bank] = delta * 10000.0
 
                 donor_tbl["Max. Reg. Divergence (bp)"] = donor_tbl["Bank"].map(max_adv_map).round(0).astype("Int64")
+                # Compute per-bank maximum ROE uplift (bp p.a.) assuming:
+                # - all available donor capacity is used for redeployment (no capacity spent on CET1 uplift),
+                # - same greedy transition allocator as in chart (2).
+                try:
+                    sim_df_max = sim_df.copy()
+                    # Force an oversized RWA reduction target so the allocator is capacity-constrained (not target-constrained).
+                    sim_df_max["Effective_RWA_Reduction_EUR_bn_Tot"] = 1e12
+                    sim_df_max["Gross_RWA_Offload_EUR_bn_Tot"] = 1e12
+
+                    roe_df_maxcap = compute_roe_delta_transitions_greedy(
+                        sim_df_max,
+                        banks_sel,
+                        util=100.0,  # will be clamped inside allocator to ~1.0 => redeployment consumes all capacity
+                        apply_util_target_scaling=True,
+                        override_srt_cost_bp=override_srt_cost_bp,
+                        override_tax_rate=override_tax_rate,
+                        require_exact_target=False,
+                        target_tolerance_pct=tol_pct,
+                        donor_availability_pct_by_donor=donor_availability_pct,
+                    )
+
+                    max_roe_map = (
+                        roe_df_maxcap.groupby("Bank")["ROE_delta_bp"].max().to_dict()
+                        if isinstance(roe_df_maxcap, pd.DataFrame) and not roe_df_maxcap.empty
+                        else {}
+                    )
+                    donor_tbl["Max. ROE uplift (bp)"] = donor_tbl["Bank"].map(max_roe_map).round(0).astype("Int64")
+                except Exception:
+                    donor_tbl["Max. ROE uplift (bp)"] = np.nan
+
             except Exception:
                 donor_tbl["Max. Reg. Divergence (bp)"] = np.nan
 
