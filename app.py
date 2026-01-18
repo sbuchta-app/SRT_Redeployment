@@ -911,7 +911,7 @@ import itertools
 # Implementation note: CSS targeting Streamlit's generated DOM can be brittle across versions.
 # We therefore insert two narrow "separator" columns between the three control columns.
 
-_SEPARATOR_STYLE = "border-left: 1px solid rgba(49, 51, 63, 0.20); height: 700px; margin: 0 auto;"
+_SEPARATOR_STYLE = "border-left: 1px solid rgba(49, 51, 63, 0.20); height: 750px; margin: 0 auto;"
 
 def _draw_vsep():
     # Large height ensures the line spans the full height of the controls area.
@@ -965,7 +965,8 @@ with _tc1:
         min_value=0,
         max_value=400,
         value=168,
-        step=5,
+        step=1,
+        help="Required CET1-uplift in basis points to compensate for US regulatory advantage",
     )
 
     
@@ -973,14 +974,14 @@ with _tc1:
     # Redeployment / CET1-Split — moved below US advantage in left column
     util = st.slider(
         "Redeployment / CET1-Split (%)",
-        min_value=0,
-        max_value=100,
-        value=50,
-        step=1,
-        help="Defines how RWAs freed by offloading are used. 100% means 100% of freed RWAs are redeployed into new assets and 0% go to CET1 uplift. 0% means 0% are redeployed and 100% go to CET1 uplift. Intermediate values split proportionally.",
+        min_value=0.0,
+        max_value=100.0,
+        value=50.0,
+        step=0.1,
+        format="%.1f",
+        help="This slider lets you choose the share of the RWAs to be redeployed while maintaining your CET1-upflift target (= US advantage (bp), see slider above). E.g. 75% means freed RWAs are calculated such that 100%-75% = 25% of freed RWAs can be reserved for the desired CET1-uplift, while the other 75% of freed RWAs can be used for redeployment into return-producing assets.",
         key="util_slider",
     ) / 100.0
-st.markdown("---")
 
 
 with _tc1:
@@ -1058,7 +1059,7 @@ with _tc2:
         max_value=1.0,
         value=0.75,
         step=0.01,
-    
+        help="Share of RWA relief in a significant risk transfer (SRT) recognized by regulator",
         key="srt_eff_slider",
     )
     st.markdown("---")
@@ -1092,10 +1093,29 @@ with _tc3:
 
     st.markdown("**SRT-eligible share of donor assets (% of each donor bucket, max 10%)**")
     # Defaults requested: availability sliders start at 5 (max is still 10)
-    avail_sme = st.slider("SME term available for SRT (%)", 0, 10, 5, 1, key="avail_sme")
-    avail_mid = st.slider("Mid-corp non-IG available for SRT (%)", 0, 10, 5, 1, key="avail_mid")
-    avail_em = st.slider("EM corporates available for SRT (%)", 0, 10, 5, 1, key="avail_em")
-    avail_cre = st.slider("CRE non-HVCRE available for SRT (%)", 0, 10, 5, 1, key="avail_cre")
+    avail_sme = st.slider("SME term available for SRT (%) — RW 90%", 0, 10, 5, 1, key="avail_sme")
+    avail_mid = st.slider("Mid-corp non-IG available for SRT (%) — RW 80%", 0, 10, 5, 1, key="avail_mid")
+    avail_em = st.slider("EM corporates available for SRT (%) — RW 100%", 0, 10, 5, 1, key="avail_em")
+    avail_cre = st.slider("CRE non-HVCRE available for SRT (%) — RW 95%", 0, 10, 5, 1, key="avail_cre")
+
+
+    st.markdown(
+        """
+        <div style="
+            background-color: #f2f2f2;
+            padding: 12px 14px;
+            border-radius: 6px;
+            font-size: 0.9rem;
+            color: #333333;
+        ">
+        <strong>Working assumption</strong><br/>
+        The transition engine transfers assets from donor portfolios equally to receiver-portfolios.
+        E.g. SME term is transferred 50/50 to Asset-backed lending and Prime consumer lending.
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
 
 
 donor_availability_pct = {
@@ -1136,7 +1156,7 @@ if not selected_banks:
 banks_sel = banks_f[banks_f["Bank Name"].isin(selected_banks)].copy()
 
 # Build single-scenario dict
-scenarios = {"US_Advantage": scenario_bps}
+scenarios = {"Banks": scenario_bps}
 
 effs = [round(float(srt_eff), 4)]
 
@@ -1318,7 +1338,7 @@ with left_col:
     c1, c2 = st.columns(2, gap="large")
 
     with c1:
-        st.subheader("1) Offload (Simple)")
+        st.subheader("1) Total Asset Offload")
 
         # Fixed offload display settings (sidebar toggles removed)
         yv_simple = "Assets_Offloaded_Transition_EUR_bn_Tot"
@@ -1391,7 +1411,7 @@ with left_col:
 
         st.plotly_chart(fig1, use_container_width=True)
     with c2:
-        st.subheader("2) Offload Complex (ΔROE)")
+        st.subheader("2) ROE-Uplift")
 
         fig2 = px.bar(
             roe_df,
@@ -1471,6 +1491,13 @@ with left_col:
         donor_util = donor_util.sort_values(["Donor", "Bank"])
 
         st.markdown("### 3) Donor utilization – share of eligible donor assets used")
+        st.markdown(
+            "<div style='color: #666666; font-size: 0.9rem; margin-top: -6px; margin-bottom: 12px;'>"
+            "Donor buckets are prioritized according to best transition efficiency = receiver–donor net spread / receiver-donor risk weight improvement. "
+            "Transition efficiency descending from left to right."
+            "</div>",
+            unsafe_allow_html=True,
+        )
 
         # Split utilization into CET1 vs Redeployment steps (stacked; redeployment semi-transparent)
         if "Step" in alloc_f.columns:
