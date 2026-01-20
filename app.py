@@ -976,7 +976,7 @@ import itertools
 # Implementation note: CSS targeting Streamlit's generated DOM can be brittle across versions.
 # We therefore insert two narrow "separator" columns between the three control columns.
 
-_SEPARATOR_STYLE = "border-left: 1px solid rgba(49, 51, 63, 0.20); height: 750px; margin: 0 auto;"
+_SEPARATOR_STYLE = "border-left: 1px solid rgba(49, 51, 63, 0.20); height: 950px; margin: 0 auto;"
 
 def _draw_vsep():
     # Large height ensures the line spans the full height of the controls area.
@@ -1051,56 +1051,84 @@ with _tc1:
 with _tc1:
     st.caption("Select one or more countries:")
 
-    # Default: all countries selected (keeps prior behavior: all banks available)
-    if 'selected_countries' not in st.session_state:
-        st.session_state['selected_countries'] = list(country_list)
+    # Default: Germany selected (falls back to the first available country if Germany is not in the list).
+    if "selected_countries" not in st.session_state:
+        if "Germany" in country_list:
+            st.session_state["selected_countries"] = ["Germany"]
+        else:
+            st.session_state["selected_countries"] = [country_list[0]] if len(country_list) else []
+
+    # Track the previous country selection so we can detect changes and sync bank selections.
+    if "prev_selected_countries" not in st.session_state:
+        st.session_state["prev_selected_countries"] = list(st.session_state.get("selected_countries", []))
 
     selected_countries = st.multiselect(
-        'Countries',
+        "Countries",
         options=country_list,
-        default=st.session_state.get('selected_countries', list(country_list)),
-        key='selected_countries_multiselect',
-        help='Filter the bank universe by country',
+        default=st.session_state.get("selected_countries", ["Germany"]),
+        key="selected_countries_multiselect",
+        help="Filter the bank universe by country",
     )
 
-    st.session_state['selected_countries'] = list(selected_countries)
+    selected_countries = list(selected_countries)
+    prev_selected_countries = list(st.session_state.get("prev_selected_countries", []))
+    countries_changed = set(selected_countries) != set(prev_selected_countries)
+
+    st.session_state["selected_countries"] = selected_countries
 
     # Apply the country filter to the bank universe
     if selected_countries:
-        banks_f = banks[banks['Country'].astype(str).isin(selected_countries)].copy()
+        banks_f = banks[banks["Country"].astype(str).isin(selected_countries)].copy()
     else:
-        # If nothing is selected, show all banks (equivalent to no filter)
         banks_f = banks.copy()
 
-    bank_list = sorted(banks_f['Bank Name'].dropna().astype(str).unique().tolist())
+    bank_list = sorted(banks_f["Bank Name"].dropna().astype(str).unique().tolist())
 
-    st.markdown('---')
+    # ------------------------------------------------------------
+    # Country -> Bank linkage
+    # ------------------------------------------------------------
+    # If the country selection changed, automatically (de)select banks so that:
+    #   - selecting a country selects *all* banks in that country
+    #   - deselecting a country deselects *all* banks in that country
+    # After the initial sync on country change, users can still fine-tune banks manually.
+    if countries_changed:
+        if selected_countries:
+            auto_banks = list(bank_list)  # all banks in the selected countries
+        else:
+            auto_banks = []
+
+        st.session_state["selected_banks"] = auto_banks
+        # Also set the widget state so the bank multiselect reflects the sync immediately.
+        st.session_state["selected_banks_multiselect"] = auto_banks
+        st.session_state["prev_selected_countries"] = selected_countries
+
+    st.markdown("---")
     st.caption("Select one or more banks:")
 
     # Defaults: prefer LBBW and Deutsche Bank if present; otherwise fall back to first bank
-    preferred_defaults = [b for b in ['LBBW', 'Deutsche Bank'] if b in bank_list]
+    preferred_defaults = [b for b in ["LBBW", "Deutsche Bank"] if b in bank_list]
     if not preferred_defaults and bank_list:
         preferred_defaults = [bank_list[0]]
 
     # Use a single multi-select dropdown instead of many checkboxes
-    if 'selected_banks' not in st.session_state:
-        st.session_state['selected_banks'] = preferred_defaults
+    if "selected_banks" not in st.session_state:
+        st.session_state["selected_banks"] = preferred_defaults
 
     # If the country filter removed some previously selected banks, drop them
-    prev = st.session_state.get('selected_banks', [])
-    prev = [b for b in prev if b in bank_list]
-    default_banks = prev if prev else preferred_defaults
+    prev_banks = st.session_state.get("selected_banks", [])
+    prev_banks = [b for b in prev_banks if b in bank_list]
+    default_banks = prev_banks if prev_banks else preferred_defaults
 
     selected_banks = st.multiselect(
-        'Banks',
+        "Banks",
         options=bank_list,
-        default=default_banks,
-        key='selected_banks_multiselect',
-        help='Select one or more banks',
+        default=st.session_state.get("selected_banks_multiselect", default_banks),
+        key="selected_banks_multiselect",
+        help="Select one or more banks",
     )
 
     # Keep the rest of the app compatible (it expects st.session_state['selected_banks'])
-    st.session_state['selected_banks'] = list(selected_banks)
+    st.session_state["selected_banks"] = list(selected_banks)
 
 
 # ------------------------------------------------------------
@@ -1136,12 +1164,12 @@ with _tc2:
     )
 
     # SRT cost is controlled via slider (CSV-supplied SRT Cost (%) is ignored).
-    # SRT cost slider (0–15 bps, default 2 bps)
+    # SRT cost slider (0–40 bps, default 2 bps)
     override_srt_cost_bp = st.slider(
         "SRT cost (bps)",
         min_value=0,
-        max_value=20,
-        value=10,
+        max_value=40,
+        value=20,
         step=1,
         help=(
             "SRT cost in basis points. This slider overrides/ignores any SRT Cost (%) values "
