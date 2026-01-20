@@ -1051,12 +1051,9 @@ with _tc1:
 with _tc1:
     st.caption("Select one or more countries:")
 
-    # Default: Germany selected (falls back to the first available country if Germany is not in the list).
+    # Default: all countries selected (keeps prior behavior: all banks available)
     if "selected_countries" not in st.session_state:
-        if "Germany" in country_list:
-            st.session_state["selected_countries"] = ["Germany"]
-        else:
-            st.session_state["selected_countries"] = [country_list[0]] if len(country_list) else []
+        st.session_state["selected_countries"] = (["Germany"] if "Germany" in country_list else ([country_list[0]] if len(country_list) else []))
 
     # Track the previous country selection so we can detect changes and sync bank selections.
     if "prev_selected_countries" not in st.session_state:
@@ -1212,7 +1209,17 @@ with _tc3:
     )
 
     def _bucket_label(x: str) -> str:
-        return str(x).replace("B1_", "").replace("B2_", "").replace("_", " ").title()
+        s = str(x)
+        # Custom display labels for donor buckets (B1)
+        if s in {"B1_SME_TERM", "SME_TERM"}:
+            return "SME Term"
+        if s in {"B1_MIDCORP_NONIG", "MIDCORP_NONIG"}:
+            return "Mid-Corp Non-IG"
+        if s in {"B1_EM_CORP", "EM_CORP"}:
+            return "EM Corp"
+        if s in {"B1_CRE_NON_HVCRE", "CRE_NON_HVCRE"}:
+            return "Non-HVCRE"
+        return s.replace("B1_", "").replace("B2_", "").replace("_", " ").title()
 
     # Determine eligible receivers per donor under current settings (eligibility depends on SRT eff/cost and Δ matrices)
     _srt_cost_bps_for_elig = float(override_srt_cost_bp) if override_srt_cost_bp is not None else 2.0
