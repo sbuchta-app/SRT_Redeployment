@@ -130,6 +130,7 @@ def _eligible_cells_by_donor(
     delta_rwa_pp: Dict[Tuple[str, str], float],
     delta_spread_bps: Dict[Tuple[str, str], float],
     donor_availability_pct_by_donor: Optional[Dict[str, float]] = None,
+    receiver_split_by_donor: Optional[Dict[str, Dict[str, float]]] = None,
 ) -> Dict[str, List[Cell]]:
     """Return all *eligible* receiver cells per donor.
 
@@ -209,6 +210,7 @@ def allocate_rwa_reduction_equal_receivers(
     donor_exposure_eur_bn: Dict[str, float],
     srt_efficiency: float,
     srt_cost_dec: float,
+    receiver_split_by_donor: Optional[Dict[str, Dict[str, float]]] = None,
     donor_availability_pct_by_donor: Optional[Dict[str, float]] = None,
 ) -> Dict[str, object]:
     """Allocator (Segment B only) with *equal split across eligible receivers*.
@@ -231,7 +233,7 @@ def allocate_rwa_reduction_equal_receivers(
         srt_cost_dec=float(srt_cost_dec),
         delta_rwa_pp=DELTA_RWA_PP_B,
         delta_spread_bps=DELTA_SPREAD_BPS_B,
-        donor_availability_pct_by_donor=donor_availability_pct_by_donor,
+            donor_availability_pct_by_donor=donor_availability_pct_by_donor,
     )
 
     if not cells_by_donor:
@@ -275,13 +277,47 @@ def allocate_rwa_reduction_equal_receivers(
         if expo_used_total <= 0:
             continue
 
-        # Split equally across eligible receivers
+        # Split across eligible receivers (user-defined weights if provided; otherwise equal)
         cells = cells_by_donor[d]
-        k = len(cells)
-        expo_each = expo_used_total / k
+
+        # Build receiver weights map for this donor
+        w_map = {}
+        if receiver_split_by_donor and isinstance(receiver_split_by_donor, dict):
+            w_map = receiver_split_by_donor.get(d, {}) or {}
+
+        # Filter weights to eligible receivers (cell[0] is receiver id) and positive values
+        weights = []
+        receivers = []
+        for cell_obj in cells:
+            r = cell_obj.receiver
+            w = w_map.get(r, None)
+            if w is None:
+                continue
+            try:
+                wv = float(w)
+            except Exception:
+                continue
+            if wv > 0:
+                receivers.append(r)
+                weights.append(wv)
+
+        if len(weights) == 0:
+            # fallback: equal split across eligible receivers
+            receivers = [c.receiver for c in cells]
+            weights = [1.0] * len(receivers)
+
+        # Normalize
+        w_sum = float(sum(weights)) if weights else 0.0
+        if w_sum <= 0:
+            receivers = [c.receiver for c in cells]
+            weights = [1.0] * len(receivers)
+            w_sum = float(sum(weights))
+
+        w_norm = {r: (w / w_sum) for r, w in zip(receivers, weights)}
 
         for cell in cells:
-            expo_used = expo_each
+            r = cell.receiver
+            expo_used = expo_used_total * float(w_norm.get(r, 0.0))
             rwa_red = expo_used * red_per_eur
             assets_redeploy = rwa_red / float(cell.receiver_risk_weight)
 
@@ -492,6 +528,7 @@ def compute_roe_delta_transitions_greedy(
     override_tax_rate: float | None = None,
     donor_split_override_by_bank: Optional[Dict[str, Dict[str, float]]] = None,
     donor_availability_pct_by_donor: Optional[Dict[str, float]] = None,
+    receiver_split_by_donor: Optional[Dict[str, Dict[str, float]]] = None,
     require_exact_target: bool = False,
     target_tolerance_pct: float = 0.5,
 ) -> pd.DataFrame:
@@ -636,6 +673,7 @@ def compute_roe_delta_transitions_greedy(
         # ------------------------------
         alloc_redeploy = allocate_rwa_reduction_equal_receivers(
             rwa_target_redeploy_yr, donor_expo, srt_eff_i, sc_i_pre,
+            receiver_split_by_donor=receiver_split_by_donor,
             donor_availability_pct_by_donor=donor_availability_pct_by_donor
         )
 
@@ -659,6 +697,7 @@ def compute_roe_delta_transitions_greedy(
         # ------------------------------
         alloc_cet1 = allocate_rwa_reduction_equal_receivers(
             rwa_target_cet1_yr, donor_expo_remaining, srt_eff_i, sc_i_pre,
+            receiver_split_by_donor=receiver_split_by_donor,
             donor_availability_pct_by_donor=donor_availability_pct_by_donor
         )
 
@@ -921,6 +960,14 @@ banks["Bank Name"] = banks["Bank Name"].astype(str)
 # Build bank list (used by bank toggles)
 bank_list = sorted(banks["Bank Name"].dropna().astype(str).unique().tolist())
 
+# Build country list (used by country multi-select)
+if 'Country' in banks.columns:
+    country_list = sorted(
+        banks['Country'].dropna().astype(str).map(str.strip).replace('', pd.NA).dropna().unique().tolist()
+    )
+else:
+    country_list = []
+
 # ---------------- Top controls header (3 columns) ----------------
 # Controls previously in the right "sidebar" column are now rendered in a dashboard-style header.
 import itertools
@@ -1002,28 +1049,58 @@ with _tc1:
 
 
 with _tc1:
+    st.caption("Select one or more countries:")
+
+    # Default: all countries selected (keeps prior behavior: all banks available)
+    if 'selected_countries' not in st.session_state:
+        st.session_state['selected_countries'] = list(country_list)
+
+    selected_countries = st.multiselect(
+        'Countries',
+        options=country_list,
+        default=st.session_state.get('selected_countries', list(country_list)),
+        key='selected_countries_multiselect',
+        help='Filter the bank universe by country',
+    )
+
+    st.session_state['selected_countries'] = list(selected_countries)
+
+    # Apply the country filter to the bank universe
+    if selected_countries:
+        banks_f = banks[banks['Country'].astype(str).isin(selected_countries)].copy()
+    else:
+        # If nothing is selected, show all banks (equivalent to no filter)
+        banks_f = banks.copy()
+
+    bank_list = sorted(banks_f['Bank Name'].dropna().astype(str).unique().tolist())
+
+    st.markdown('---')
     st.caption("Select one or more banks:")
 
-    def _safe_bank_key(name: str) -> str:
-        return re.sub(r"[^a-zA-Z0-9_]+", "_", str(name))
-
     # Defaults: prefer LBBW and Deutsche Bank if present; otherwise fall back to first bank
-    preferred_defaults = [b for b in ["LBBW", "Deutsche Bank"] if b in bank_list]
+    preferred_defaults = [b for b in ['LBBW', 'Deutsche Bank'] if b in bank_list]
     if not preferred_defaults and bank_list:
         preferred_defaults = [bank_list[0]]
 
-    if "selected_banks" not in st.session_state:
-        st.session_state["selected_banks"] = preferred_defaults
+    # Use a single multi-select dropdown instead of many checkboxes
+    if 'selected_banks' not in st.session_state:
+        st.session_state['selected_banks'] = preferred_defaults
 
-    selected_banks = []
-    for _b in bank_list:
-        _k = f"bank_cb_{_safe_bank_key(_b)}"
-        default_on = (_b in st.session_state.get("selected_banks", preferred_defaults))
-        val = st.checkbox(_b, key=_k, value=default_on)
-        if val:
-            selected_banks.append(_b)
+    # If the country filter removed some previously selected banks, drop them
+    prev = st.session_state.get('selected_banks', [])
+    prev = [b for b in prev if b in bank_list]
+    default_banks = prev if prev else preferred_defaults
 
-    st.session_state["selected_banks"] = selected_banks
+    selected_banks = st.multiselect(
+        'Banks',
+        options=bank_list,
+        default=default_banks,
+        key='selected_banks_multiselect',
+        help='Select one or more banks',
+    )
+
+    # Keep the rest of the app compatible (it expects st.session_state['selected_banks'])
+    st.session_state['selected_banks'] = list(selected_banks)
 
 
 # ------------------------------------------------------------
@@ -1041,25 +1118,8 @@ if not BANK_COLOR_SEQ:
 BANK_COLOR_MAP = {b: BANK_COLOR_SEQ[i % len(BANK_COLOR_SEQ)] for i, b in enumerate(BANK_ORDER)}
 
 
-# Defaults requested: time horizon starts at 5 years
-
-# No Country/Region filtering for now
-banks_f = banks.copy()
-
-# Filters (Country/Region) removed as requested
-
-# Bank selection
-bank_list = sorted(banks_f["Bank Name"].unique().tolist())
-
-# Defaults requested: preselect only LBBW and Deutsche Bank (if present in filtered list)
-preferred_defaults = ["Landesbank Baden-Württemberg", "Deutsche Bank AG"]
-default_sel = [b for b in preferred_defaults if b in bank_list]
-if not default_sel:
-    default_sel = bank_list[: min(8, len(bank_list))]
-# Per-bank toggles (multiple banks can be selected)
-
-
 override_srt_cost_bp = override_tax_rate = None
+receiver_split_by_donor = None
 
 
 with _tc2:
@@ -1080,12 +1140,12 @@ with _tc2:
     override_srt_cost_bp = st.slider(
         "SRT cost (bps)",
         min_value=0,
-        max_value=15,
-        value=2,
+        max_value=20,
+        value=10,
         step=1,
         help=(
             "SRT cost in basis points. This slider overrides/ignores any SRT Cost (%) values "
-            "supplied via the CSV. Default is 2× the model fallback cost."
+            "supplied via the CSV."
         ),
         key="srt_cost_bps_slider",
     )
@@ -1103,29 +1163,225 @@ with _tc3:
 
     st.markdown("**SRT-eligible share of donor assets (% of each donor bucket, max 10%)**")
     # Defaults requested: availability sliders start at 5 (max is still 10)
-    avail_sme = st.slider("SME term available for SRT (%) — RW 90%", 0, 10, 5, 1, key="avail_sme")
-    avail_mid = st.slider("Mid-corp non-IG available for SRT (%) — RW 80%", 0, 10, 5, 1, key="avail_mid")
-    avail_em = st.slider("EM corporates available for SRT (%) — RW 100%", 0, 10, 5, 1, key="avail_em")
-    avail_cre = st.slider("CRE non-HVCRE available for SRT (%) — RW 95%", 0, 10, 5, 1, key="avail_cre")
+    avail_sme = st.slider("SME term available for SRT (%) — RW 90%", 0, 20, 10, 1, key="avail_sme")
+    avail_mid = st.slider("Mid-corp non-IG available for SRT (%) — RW 80%", 0, 20, 10, 1, key="avail_mid")
+    avail_em = st.slider("EM corporates available for SRT (%) — RW 100%", 0, 20, 10, 1, key="avail_em")
+    avail_cre = st.slider("CRE non-HVCRE available for SRT (%) — RW 95%", 0, 20, 10, 1, key="avail_cre")
+
+    # Donor availability caps (% of each donor bucket, per year)
+    donor_availability_pct = {
+        "B1_SME_TERM": float(avail_sme),
+        "B1_MIDCORP_NONIG": float(avail_mid),
+        "B1_EM_CORP": float(avail_em),
+        "B1_CRE_NON_HVCRE": float(avail_cre),
+    }
 
 
+    st.markdown("### Receiver split per donor")
+    st.caption(
+        "Choose how each donor bucket is split across its eligible receiver portfolios. "
+        "Each row is normalized to 100% (eligible columns only). Non-eligible donor→receiver cells are disabled."
+    )
+
+    def _bucket_label(x: str) -> str:
+        return str(x).replace("B1_", "").replace("B2_", "").replace("_", " ").title()
+
+    # Determine eligible receivers per donor under current settings (eligibility depends on SRT eff/cost and Δ matrices)
+    _srt_cost_bps_for_elig = float(override_srt_cost_bp) if override_srt_cost_bp is not None else 2.0
+    _eligible_map = {}
+    for _d in B1_DONORS:
+        _cells_map = _eligible_cells_by_donor(
+            donors=[_d],
+            srt_efficiency=float(srt_eff),
+            srt_cost_dec=float(_srt_cost_bps_for_elig) / 10000.0,
+            delta_rwa_pp=DELTA_RWA_PP_B,
+            delta_spread_bps=DELTA_SPREAD_BPS_B,
+            donor_availability_pct_by_donor=donor_availability_pct,
+        )
+        _cells = _cells_map.get(_d, [])
+        _eligible_map[_d] = [c.receiver for c in _cells]
+
+    # Build a pivot-style table: donors as rows, receivers as columns
+    _donor_labels = {_d: _bucket_label(_d) for _d in B1_DONORS}
+    _recv_labels = {_r: _bucket_label(_r) for _r in B2_RECEIVERS}
+
+    _rows = []
+    for _d in B1_DONORS:
+        row = {"Donor": _donor_labels[_d], "_donor_id": _d}
+        elig = set(_eligible_map.get(_d, []))
+        # Default equal split over eligible receivers
+        k = max(len(elig), 0)
+        for _r in B2_RECEIVERS:
+            col = _recv_labels[_r]
+            if _r in elig and k > 0:
+                row[col] = 100.0 / float(k)
+            else:
+                row[col] = 0.0
+        _rows.append(row)
+
+    _splits_default = pd.DataFrame(_rows)
+
+    # Initialize session state once
+    if "receiver_split_pivot" not in st.session_state:
+        st.session_state["receiver_split_pivot"] = _splits_default
+
+    # NOTE: Streamlit's st.data_editor does not support per-cell styling.
+    # To grey out the exact same (non-eligible) cells as the preview table, we render
+    # a small grid of number_inputs and disable non-eligible cells. Disabled inputs
+    # are visually greyed out (CSS below), matching the preview behavior.
     st.markdown(
         """
-        <div style="
-            background-color: #f2f2f2;
-            padding: 12px 14px;
-            border-radius: 6px;
+        <style>
+        /* (Optional) If any disabled number inputs exist elsewhere, grey them out */
+        div[data-testid="stNumberInput"] input:disabled {
+            background-color: #eeeeee !important;
+            color: #777777 !important;
+            -webkit-text-fill-color: #777777 !important;
+        }
+
+        /* Residual (computed) cells rendered as HTML so they always refresh */
+        .residual-cell {
+            background-color: #eeeeee;
+            color: #777777;
+            border: 1px solid rgba(49, 51, 63, 0.2);
+            border-radius: 0.5rem;
+            padding: 0.38rem 0.5rem;
+            text-align: right;
             font-size: 0.9rem;
-            color: #333333;
-        ">
-        <strong>Working assumption</strong><br/>
-        The transition engine transfers assets from donor portfolios equally to receiver-portfolios.
-        E.g. SME term is transferred 50/50 to Asset-backed lending and Prime consumer lending.
-        </div>
+            line-height: 1.2;
+            width: 100%;
+            box-sizing: border-box;
+        }
+        </style>
         """,
         unsafe_allow_html=True,
     )
 
+    # Current values (already normalized to 100% across eligible receivers)
+    _cur = st.session_state["receiver_split_pivot"].copy()
+    _cur_vals_by_donor: Dict[str, Dict[str, float]] = {d: {} for d in B1_DONORS}
+    for _, _rr in _cur.iterrows():
+        _d = str(_rr.get("_donor_id", ""))
+        if _d not in _cur_vals_by_donor:
+            continue
+        for _r in B2_RECEIVERS:
+            _col = _recv_labels[_r]
+            try:
+                _cur_vals_by_donor[_d][_r] = float(_rr.get(_col, 0.0) or 0.0)
+            except Exception:
+                _cur_vals_by_donor[_d][_r] = 0.0
+
+    # Header row
+    _hcols = st.columns([1.4] + [1.0] * len(B2_RECEIVERS), gap="small")
+    _hcols[0].markdown("**Donor**")
+    for j, _r in enumerate(B2_RECEIVERS, start=1):
+        _hcols[j].markdown(f"**{_recv_labels[_r]}**")
+
+    # Input grid
+    _stored_rows = []
+    _last_receiver = B2_RECEIVERS[-1]
+
+    for _d in B1_DONORS:
+        elig = set(_eligible_map.get(_d, []))
+        _rcols = st.columns([1.4] + [1.0] * len(B2_RECEIVERS), gap="small")
+        _rcols[0].markdown(_donor_labels[_d])
+
+        row = {"Donor": _donor_labels[_d], "_donor_id": _d}
+        _running_sum = 0.0
+
+        for j, _r in enumerate(B2_RECEIVERS, start=1):
+            key = f"receiver_split_{_d}_{_r}"
+            default_v = float(_cur_vals_by_donor.get(_d, {}).get(_r, 0.0))
+
+            # Non-eligible cells: render as the same grey HTML cell used for the residual.
+            # (We avoid disabled widgets here so all greyed-out cells look identical.)
+            if _r not in elig:
+                st.session_state[key] = 0.0
+                _rcols[j].markdown(
+                    "<div class='residual-cell'>0</div>",
+                    unsafe_allow_html=True,
+                )
+                v = 0.0
+
+            # Eligible and NOT last column: user-editable.
+            elif _r != _last_receiver:
+                # Optional UX guard: cap by remaining so residual never goes negative.
+                remaining = max(0.0, 100.0 - _running_sum)
+                default_v = max(0.0, min(default_v, remaining))
+
+                v = _rcols[j].number_input(
+                    label=_recv_labels[_r],
+                    min_value=0.0,
+                    max_value=float(remaining),
+                    step=1.0,
+                    value=float(round(default_v, 0)),
+                    disabled=False,
+                    label_visibility="collapsed",
+                    key=key,
+                )
+                _running_sum += float(v)
+
+            # Eligible and last column: forced residual so the row always sums to 100%.
+            else:
+                residual = max(0.0, 100.0 - _running_sum)
+                # IMPORTANT: A Streamlit widget with a `key` will keep its value from the
+                # previous rerun, and the `value=` argument is only used for initialization.
+                # To ensure the residual cell *always* updates immediately when upstream
+                # inputs change, we render it as HTML (no widget state).
+                _rcols[j].markdown(
+                    f"<div class='residual-cell'>{float(round(residual, 0)):.0f}</div>",
+                    unsafe_allow_html=True,
+                )
+                v = float(round(residual, 0))
+
+            row[_recv_labels[_r]] = float(v)
+
+        _stored_rows.append(row)
+
+    _stored = pd.DataFrame(_stored_rows)
+
+    # Force non-eligible cells to 0.0 and normalize eligible cells to sum=1 per donor
+    receiver_split_by_donor = {}
+    _normalized_rows = []
+    for _, rr in _stored.iterrows():
+        _d = str(rr["_donor_id"])
+        elig = set(_eligible_map.get(_d, []))
+        vals = {}
+        s = 0.0
+        # collect values for eligible receivers only
+        for _r in B2_RECEIVERS:
+            if _r not in elig:
+                continue
+            col = _recv_labels[_r]
+            try:
+                v = float(rr[col])
+            except Exception:
+                v = 0.0
+            v = max(v, 0.0)
+            vals[_r] = v
+            s += v
+
+        if s <= 0:
+            # fallback to equal split
+            if len(elig) > 0:
+                receiver_split_by_donor[_d] = {r: 1.0 / float(len(elig)) for r in elig}
+            else:
+                receiver_split_by_donor[_d] = {}
+        else:
+            receiver_split_by_donor[_d] = {r: (v / s) for r, v in vals.items() if v > 0}
+
+        # build normalized row for display (0 in non-eligible cells; eligible shown as % summing to 100)
+        norm_row = {"Donor": _donor_labels[_d], "_donor_id": _d}
+        for _r in B2_RECEIVERS:
+            col = _recv_labels[_r]
+            if _r not in elig or len(elig) == 0:
+                norm_row[col] = 0.0
+            else:
+                norm_row[col] = 100.0 * receiver_split_by_donor[_d].get(_r, 0.0)
+        _normalized_rows.append(norm_row)
+
+    # Persist normalized (so table stays consistent after reruns)
+    st.session_state["receiver_split_pivot"] = pd.DataFrame(_normalized_rows)
 
 donor_availability_pct = {
     "B1_SME_TERM": float(avail_sme),
@@ -1158,7 +1414,7 @@ top_controls.markdown("---")
 
 # Validate selections
 if not selected_banks:
-    st.error("Please select at least one bank in the sidebar.")
+    st.error("Please select at least one bank in the controls above.")
     st.stop()
 
 banks_sel = banks_f[banks_f["Bank Name"].isin(selected_banks)].copy()
@@ -1182,6 +1438,7 @@ roe_port = compute_roe_delta_transitions_greedy(
     require_exact_target=require_exact,
     target_tolerance_pct=tol_pct,
     donor_availability_pct_by_donor=donor_availability_pct,
+                        receiver_split_by_donor=receiver_split_by_donor,
 )
 
 # Base (unscaled) allocator run for chart (1) base bars
@@ -1195,6 +1452,7 @@ roe_port_base = compute_roe_delta_transitions_greedy(
     require_exact_target=require_exact,
     target_tolerance_pct=tol_pct,
     donor_availability_pct_by_donor=donor_availability_pct,
+                        receiver_split_by_donor=receiver_split_by_donor,
 )
 sri_port = compute_sri(sim_port, portfolio_df)
 
@@ -1210,6 +1468,7 @@ roe_df = compute_roe_delta_transitions_greedy(
     require_exact_target=require_exact,
     target_tolerance_pct=tol_pct,
     donor_availability_pct_by_donor=donor_availability_pct,
+                        receiver_split_by_donor=receiver_split_by_donor,
 )
 
 # Base (unscaled) allocator run for chart (1) base bars
@@ -1223,6 +1482,7 @@ roe_df_base = compute_roe_delta_transitions_greedy(
     require_exact_target=require_exact,
     target_tolerance_pct=tol_pct,
     donor_availability_pct_by_donor=donor_availability_pct,
+                        receiver_split_by_donor=receiver_split_by_donor,
 )
 sri_df = compute_sri(sim_df, banks_sel)
 
@@ -1710,7 +1970,8 @@ with left_col:
                     srt_eff_dec = float(srt_eff) if "srt_eff" in globals() else 0.75
 
                     alloc_cap = allocate_rwa_reduction_equal_receivers(
-                        1e12, donor_expo, srt_eff_dec, 0.0
+                        1e12, donor_expo, srt_eff_dec, 0.0,
+                        donor_availability_pct_by_donor=donor_availability_pct,
                     )
                     eff_max_yr = float(alloc_cap.get("total_rwa_reduction_eur_bn", 0.0) or 0.0)
 
@@ -1747,6 +2008,7 @@ with left_col:
                         require_exact_target=False,
                         target_tolerance_pct=tol_pct,
                         donor_availability_pct_by_donor=donor_availability_pct,
+                        receiver_split_by_donor=receiver_split_by_donor,
                     )
 
                     max_roe_map = (
