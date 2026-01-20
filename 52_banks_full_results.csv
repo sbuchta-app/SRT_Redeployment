@@ -1,7 +1,14 @@
 Bank Name,Country,Region,Total Assets (EUR bn),Total RWA (EUR bn),CET1 Ratio (%),RWA Density (%),Net Spread (%),SRT Cost (%),Effective Tax Rate (%),Reporting Period,SME_term,MidCorp_nonIG,EM_corporates,CRE_non_HVCRE
-DekaBank Deutsche Girozentrale,Germany,Western Europe,98.06,30.61,19.9,31.2,,,31.2,H1 2025,3,3,1,3
-DZ BANK AG,Germany,Western Europe,666.0,151.5,17.9,22.7,,,,H1 2025,6,10,2,17
-Deutsche Bank AG,Germany,Western Europe,1398.0,341.0,14.2,24.4,,,28.0,H1 2025,6,9,3,7
-Commerzbank Aktiengesellschaft,Germany,Western Europe,581.8,176.1,14.6,30.3,,,27.0,H1 2025,14,8,2,6
-Landesbank Baden-Württemberg,Germany,Western Europe,369.0,85.7,16.6,23.2,,,,H1 2025,18,12,2,13
-Landesbank Hessen-Thüringen Girozentrale,Germany,Western Europe,203.3,63.4,16.3,31.2,,,,H1 2025,7,8,2,23
+DekaBank,Germany,Western Europe,98.06,30.61,19.9,31.2,,,31.2,H1 2025,3,3,1,3
+DZ BANK,Germany,Western Europe,666.0,151.5,17.9,22.7,,,,H1 2025,6,10,2,17
+Deutsche Bank,Germany,Western Europe,1398.0,341.0,14.2,24.4,,,28.0,H1 2025,2.42,3.29,1.45,2.36
+Commerzbank,Germany,Western Europe,581.8,176.1,14.6,30.3,,,27.0,H1 2025,14,8,2,6
+LBBW,Germany,Western Europe,369.0,85.7,16.6,23.2,,,,H1 2025,18,12,2,13
+HeLaBa,Germany,Western Europe,203.3,63.4,16.3,31.2,,,,H1 2025,7,8,2,23
+NordLB,Germany,Western Europe,119.425,38.412,18.02,32.2,,,20.1,H1 2025,4.9,5.7,0.8,10.6
+ABN AMRO,Netherlands,Western Europe,413.9,139.8,14.8,33.8,,,24.5,H1 2025
+Rabobank,Netherlands,Western Europe,635.9,231.6,19.9,36.4,1.85,,28.0,H1 2025
+ING,Netherlands,Western Europe,1086.8,335.8,13.3,30.9,1.4,,28.3,H1 2025
+Intesa Sanpaolo,Italy,Southern Europe,1100.0,320.0,14.0,29.0,,,,H1 2025
+UNICREDIT,Italy,Southern Europe,960.0,330.0,16.5,34.0,,,,H1 2025
+BANCO BPM,Italy,Southern Europe,200.0,95.0,14.0,47.0,,,,H1 2025
