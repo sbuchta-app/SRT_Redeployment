@@ -1186,7 +1186,7 @@ with _tc2:
 with _tc3:
     st.subheader("Transition engine controls")
 
-    st.markdown("**SRT-eligible share of donor assets (% of each donor bucket, max 10%)**")
+    st.markdown("**SRT-eligible share of donor assets (% of each donor bucket, max 20%)**")
     # Defaults requested: availability sliders start at 5 (max is still 10)
     avail_sme = st.slider("SME term available for SRT (%) — RW 90%", 0, 20, 10, 1, key="avail_sme")
     avail_mid = st.slider("Mid-corp non-IG available for SRT (%) — RW 80%", 0, 20, 10, 1, key="avail_mid")
@@ -1308,7 +1308,7 @@ with _tc3:
 
     # Header row
     _hcols = st.columns([1.4] + [1.0] * len(B2_RECEIVERS), gap="small")
-    _hcols[0].markdown("**Donor**")
+    _hcols[0].markdown("**Receiver -> Donor**")
     for j, _r in enumerate(B2_RECEIVERS, start=1):
         _hcols[j].markdown(f"**{_recv_labels[_r]}**")
 
