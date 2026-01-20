@@ -1308,7 +1308,7 @@ with _tc3:
 
     # Header row
     _hcols = st.columns([1.4] + [1.0] * len(B2_RECEIVERS), gap="small")
-    _hcols[0].markdown("**Receiver -> Donor**")
+    _hcols[0].markdown("**Donor**")
     for j, _r in enumerate(B2_RECEIVERS, start=1):
         _hcols[j].markdown(f"**{_recv_labels[_r]}**")
 
