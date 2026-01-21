@@ -1713,6 +1713,19 @@ with left_col:
     with c2:
         st.subheader("2) ROE-Uplift")
 
+        # Portfolio average ΔROE (weighted by CET1 capital proxy = Total RWA × CET1 ratio)
+        # Used as a horizontal reference line in the bank-level chart below.
+        _w = banks_sel[["Bank Name", "Total RWA (EUR bn)", "CET1 Ratio (%)"]].copy()
+        _w["weight"] = _w["Total RWA (EUR bn)"] * _w["CET1 Ratio (%)"]
+
+        _tmp = roe_df.merge(_w[["Bank Name", "weight"]], left_on="Bank", right_on="Bank Name", how="left")
+        _tmp = _tmp.dropna(subset=["weight"])
+
+        roe_port_avg = (
+            _tmp.groupby(["Scenario", "SRT_Efficiency"], as_index=False)
+                .apply(lambda g: pd.Series({"ROE_delta_bp": float(np.average(g["ROE_delta_bp"], weights=g["weight"]))}))
+        )
+
         fig2 = px.bar(
             roe_df,
             x="Scenario",
@@ -1724,6 +1737,36 @@ with left_col:
             labels={"ROE_delta_bp": "ΔROE (bp p.a.)", "Scenario": "", "Bank": "Bank"},
             title="ΔROE (bp p.a.) – Banks (transition-based)"
         )
+
+        # Add portfolio-average reference line(s) (one per SRT efficiency, if applicable)
+        # Use add_hline so the reference is visible even when there is only a single x-category.
+        if isinstance(roe_port_avg, pd.DataFrame) and not roe_port_avg.empty:
+            multi_eff = ("SRT_Efficiency" in roe_port_avg.columns) and (roe_port_avg["SRT_Efficiency"].nunique(dropna=False) > 1)
+            for _eff_key, g in roe_port_avg.groupby("SRT_Efficiency", dropna=False) if "SRT_Efficiency" in roe_port_avg.columns else [(None, roe_port_avg)]:
+                # Expect one value per scenario; if multiple scenarios exist, draw one hline per scenario.
+                for _scen, gg in g.groupby("Scenario", dropna=False) if "Scenario" in g.columns else [(None, g)]:
+                    y_val = float(gg["ROE_delta_bp"].iloc[0])
+                    label = f"Portfolio avg ({_eff_key})" if multi_eff else "Portfolio avg"
+                    if _scen not in (None, "") and (("Scenario" in roe_df.columns) and (roe_df["Scenario"].nunique() > 1)):
+                        label = f"{label} – {_scen}"
+                    fig2.add_hline(
+                        y=y_val,
+                        line_dash="dash",
+                        line_width=2
+                    )
+                    # Add a dummy trace so the portfolio-average line appears in the legend
+                    fig2.add_trace(
+                        go.Scatter(
+                            x=[None],
+                            y=[None],
+                            mode="lines",
+                            name="Portfolio avg",
+                            line=dict(dash="dash", width=2, color="black"),
+                            showlegend=True,
+                            hoverinfo="skip",
+                        )
+                    )
+
         fig2.update_layout(
             legend_title_text="Bank",
             legend_orientation="v",
@@ -2093,18 +2136,72 @@ with left_col:
     st.markdown("---")
     st.subheader("PORTFOLIO (aggregate across selected banks)")
 
-    # Fixed offload metric for portfolio (same as simple chart)
+    # Required offload portfolio = sum of chart (1) across banks (keep CET1/ROE split)
     yv = yv_simple
-    yl = yl_simple
+    yl = "Offloaded assets (EUR bn, total, transition-based) — sum across banks"
+
+    # Rebuild the same CET1 vs ROE split used in chart (1)
+    _util_disp_p = min(float(util), 0.999)
+    _factor_p = _util_disp_p / (1.0 - _util_disp_p)  # == util/(1-util)
+
+    port_base = (
+        sim_df.groupby(["Scenario", "SRT_Efficiency"], as_index=False)[yv]
+        .sum()
+        .rename(columns={yv: "CET1_uplift_assets"})
+    )
+    port_base["ROE_uplift_assets"] = port_base["CET1_uplift_assets"] * _factor_p
+
+    port_long = port_base.melt(
+        id_vars=["Scenario", "SRT_Efficiency"],
+        value_vars=["CET1_uplift_assets", "ROE_uplift_assets"],
+        var_name="Component",
+        value_name="Assets_offloaded_EUR_bn",
+    )
+    port_long["Component"] = port_long["Component"].map({
+        "CET1_uplift_assets": "CET1-uplift",
+        "ROE_uplift_assets": "ROE-uplift",
+    })
+    # Ensure one bar per Scenario/Component/(SRT_Efficiency) so Plotly can stack reliably
+    port_long = (
+        port_long.groupby(["Scenario", "SRT_Efficiency", "Component"], as_index=False)["Assets_offloaded_EUR_bn"]
+        .sum()
+    )
+
 
     figP1 = px.bar(
-        sim_port,
+        port_long,
         x="Scenario",
-        y=yv,
-        color="SRT_Efficiency",
-        barmode="group",
-        labels={yv: yl, "Scenario": "", "SRT_Efficiency": "SRT-Efficiency"},
-        title="Required Offload – Portfolio"
+        y="Assets_offloaded_EUR_bn",
+        color="Component",
+        barmode="stack",
+        category_orders={"Component": ["CET1-uplift", "ROE-uplift"]},
+        facet_col="SRT_Efficiency" if len(effs) > 1 else None,
+        labels={
+            "Assets_offloaded_EUR_bn": yl,
+            "Scenario": "",
+            "SRT_Efficiency": "SRT-Efficiency",
+            "Component": "",
+        },
+        title="Required Offload – Portfolio (sum across selected banks)",
+    )
+
+    # Force true stacking (Plotly stacks only within the same offsetgroup; px.bar may set different offsetgroups)
+    for _tr in figP1.data:
+        _tr.offsetgroup = "portfolio"
+        _tr.alignmentgroup = "portfolio"
+    figP1.update_layout(barmode="stack")
+
+    # Portfolio ΔROE: weighted average of bank-level ΔROE (from chart 2),
+    # weights = Total RWA (EUR bn) × CET1 Ratio (%), taken from input data.
+    _w = banks_sel[["Bank Name", "Total RWA (EUR bn)", "CET1 Ratio (%)"]].copy()
+    _w["weight"] = _w["Total RWA (EUR bn)"] * _w["CET1 Ratio (%)"]
+
+    _tmp = roe_df.merge(_w[["Bank Name", "weight"]], left_on="Bank", right_on="Bank Name", how="left")
+    _tmp = _tmp.dropna(subset=["weight"])
+
+    roe_port = (
+        _tmp.groupby(["Scenario", "SRT_Efficiency"], as_index=False)
+            .apply(lambda g: pd.Series({"ROE_delta_bp": float(np.average(g["ROE_delta_bp"], weights=g["weight"]))}))
     )
 
     figP2 = px.bar(
@@ -2116,6 +2213,7 @@ with left_col:
         labels={"ROE_delta_bp": "ΔROE (bp p.a.)", "Scenario": "", "SRT_Efficiency": "SRT-Efficiency"},
         title="ΔROE (bp p.a.) – Portfolio (transition-based)"
     )
+    figP1.update_layout(legend_traceorder="reversed")
 
     pcol1, pcol2 = st.columns(2, gap="large")
     with pcol1:
