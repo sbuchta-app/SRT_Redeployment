@@ -1186,7 +1186,7 @@ with _tc2:
 with _tc3:
     st.subheader("Transition engine controls")
 
-    st.markdown("**SRT-eligible share of donor assets (% of each donor bucket, max 20%)**")
+    st.markdown("**SRT-eligible share of donor assets**")
     # Defaults requested: availability sliders start at 5 (max is still 10)
     avail_sme = st.slider("SME term available for SRT (%) — RW 90%", 0, 20, 10, 1, key="avail_sme")
     avail_mid = st.slider("Mid-corp non-IG available for SRT (%) — RW 80%", 0, 20, 10, 1, key="avail_mid")
@@ -2058,9 +2058,34 @@ with left_col:
             except Exception:
                 donor_tbl["Max. Reg. Divergence (bp)"] = np.nan
 
+
+            # --- RWA offload (CET1 uplift + ROE uplift) per bank ---
+            try:
+                audit_df = getattr(roe_df, "attrs", {}).get("allocations_audit_df", None)
+                if isinstance(audit_df, pd.DataFrame) and not audit_df.empty:
+                    # Sum annual RWA reductions by step and convert to total-horizon RWAs
+                    by_step = (
+                        audit_df.groupby(["Bank", "Step"], dropna=False)["RWA_reduction_EUR_bn_Yr"]
+                        .sum()
+                        .unstack(fill_value=0.0)
+                    )
+                    rwa_cet1_tot = by_step.get("CET1", 0.0) * float(years)
+                    rwa_roe_tot = by_step.get("REDEPLOY", 0.0) * float(years)
+                    rwa_sum_map = (rwa_cet1_tot + rwa_roe_tot).to_dict()
+                    donor_tbl["RWA freed (EUR bn)"] = donor_tbl["Bank"].map(rwa_sum_map).round(0).astype("Int64").astype("Int64")
+                else:
+                    donor_tbl["RWA freed (EUR bn)"] = np.nan
+            except Exception:
+                donor_tbl["RWA freed (EUR bn)"] = np.nan
+
             st.markdown("**Donor bucket weights per selected bank (from input data)**")
             st.dataframe(
                 donor_tbl,
+                column_config={
+                    "RWA freed (EUR bn)": st.column_config.NumberColumn(
+                        "RWA freed (EUR bn)", format="%.0f"
+                    )
+                },
                 use_container_width=True,
                 hide_index=True,
             )
