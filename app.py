@@ -1301,7 +1301,7 @@ with _tc1:
         "Time horizon (years)",
         min_value=1,
         max_value=10,
-        value=5,
+        value=1,
         step=1,
     )
 
