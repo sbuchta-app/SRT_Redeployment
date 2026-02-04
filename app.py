@@ -9,6 +9,9 @@ TOTAL_ASSETS_COL = "Total Assets (EUR bn)"
 # Fallback SRT cost used by the model (input CSV values are ignored; overridden via UI slider).
 DEFAULT_SRT_COST_PCT = 0.2  # percent (0.2% = 20 bps)
 
+# Multiplier to increase the donor capacity made available to the allocator (annualized capacity).
+ALLOCATOR_CAPACITY_MULTIPLIER = 3.0
+
 
 import numpy as np
 import pandas as pd
@@ -354,6 +357,191 @@ def allocate_rwa_reduction_equal_receivers(
         "ranked_donors": [(d, "MULTI", len(cells_by_donor[d])) for d in B1_DONORS if d in cells_by_donor],
         "status": status,
     }
+
+def allocate_until_profit_target(
+    profit_target_eur_bn_yr: float,
+    donor_exposure_eur_bn: Dict[str, float],
+    srt_efficiency: float,
+    srt_cost_dec: float,
+    tax_dec: float,
+    receiver_split_by_donor: Optional[Dict[str, Dict[str, float]]] = None,
+    donor_availability_pct_by_donor: Optional[Dict[str, float]] = None,
+) -> Dict[str, object]:
+    """Allocator (Segment B) that allocates donor exposure until a *profit* target is met.
+
+    - Uses the same donor->receiver eligibility logic as `allocate_rwa_reduction_equal_receivers`
+      (ΔRWA < 0 and ΔSpread > 0, after SRT-cost adjustment).
+    - Uses the user-provided receiver split matrix (per donor) when available; otherwise falls back to equal split.
+    - Prioritizes donors by *profit per EUR exposure* (weighted-average across the eligible receivers for that donor
+      under the receiver split).
+
+    Returns allocations plus achieved profit / RWA reduction / exposure used.
+    """
+    profit_target = float(profit_target_eur_bn_yr) if profit_target_eur_bn_yr is not None else 0.0
+    if not np.isfinite(profit_target) or profit_target <= 0:
+        return {
+            "allocations": [],
+            "total_profit_eur_bn_yr": 0.0,
+            "total_rwa_reduction_eur_bn": 0.0,
+            "total_exposure_used_eur_bn": 0.0,
+            "total_assets_redeploy_used_eur_bn": 0.0,
+            "remaining_profit_target_eur_bn_yr": max(0.0, profit_target),
+            "ranked_donors": [],
+            "status": "NO_PROFIT_TARGET",
+        }
+
+    donors = [d for d in B1_DONORS if donor_exposure_eur_bn.get(d, 0.0) > 0]
+
+    cells_by_donor = _eligible_cells_by_donor(
+        donors=donors,
+        srt_efficiency=float(srt_efficiency),
+        srt_cost_dec=float(srt_cost_dec),
+        delta_rwa_pp=DELTA_RWA_PP_B,
+        delta_spread_bps=DELTA_SPREAD_BPS_B,
+        donor_availability_pct_by_donor=donor_availability_pct_by_donor,
+    )
+
+    if not cells_by_donor:
+        return {
+            "allocations": [],
+            "total_profit_eur_bn_yr": 0.0,
+            "total_rwa_reduction_eur_bn": 0.0,
+            "total_exposure_used_eur_bn": 0.0,
+            "total_assets_redeploy_used_eur_bn": 0.0,
+            "remaining_profit_target_eur_bn_yr": profit_target,
+            "ranked_donors": [],
+            "status": "NO_ELIGIBLE_TRANSITIONS",
+        }
+
+    eff = float(srt_efficiency)
+    tx = float(tax_dec) if np.isfinite(float(tax_dec)) else 0.0
+    tx = max(min(tx, 1.0), 0.0)
+
+    donor_rank = []
+    donor_receiver_weights: Dict[str, Dict[str, float]] = {}
+    donor_profit_per_expo: Dict[str, float] = {}
+
+    # Pre-compute receiver weights + weighted-average profit per EUR exposure for each donor
+    for d, cells in cells_by_donor.items():
+        w_map = (receiver_split_by_donor or {}).get(d, {}) if isinstance(receiver_split_by_donor, dict) else {}
+        receivers, weights = [], []
+        for c in cells:
+            r = c.receiver
+            w = w_map.get(r, None)
+            if w is None:
+                continue
+            try:
+                wv = float(w)
+            except Exception:
+                continue
+            if wv > 0:
+                receivers.append(r)
+                weights.append(wv)
+
+        if len(weights) == 0:
+            receivers = [c.receiver for c in cells]
+            weights = [1.0] * len(receivers)
+
+        w_sum = float(sum(weights)) if weights else 0.0
+        if w_sum <= 0:
+            receivers = [c.receiver for c in cells]
+            weights = [1.0] * len(receivers)
+            w_sum = float(sum(weights))
+
+        w_norm = {r: (w / w_sum) for r, w in zip(receivers, weights)}
+        donor_receiver_weights[d] = w_norm
+
+        avg_delta_s_eff = 0.0
+        for c in cells:
+            avg_delta_s_eff += float(w_norm.get(c.receiver, 0.0)) * float(c.delta_s_eff_dec)
+
+        profit_per_expo = avg_delta_s_eff * (1.0 - tx)
+        donor_profit_per_expo[d] = float(profit_per_expo)
+        donor_rank.append((d, float(profit_per_expo), len(cells)))
+
+    # IMPORTANT: consume donors in the fixed, user-expected order:
+    # SME term -> Mid-corp -> EM corp -> CRE Non-HV-CRE
+    remaining_profit = profit_target
+    allocs: List[Allocation] = []
+    total_profit = 0.0
+    total_rwa_red = 0.0
+    total_expo = 0.0
+    total_assets_redeploy = 0.0
+
+    for d in B1_DONORS:
+        if remaining_profit <= 1e-12:
+            break
+        if d not in cells_by_donor:
+            continue
+
+        profit_per_expo = float(donor_profit_per_expo.get(d, 0.0))
+        if profit_per_expo <= 0:
+            continue
+
+        expo_avail = float(donor_exposure_eur_bn.get(d, 0.0))
+        if expo_avail <= 0:
+            continue
+
+        expo_needed = remaining_profit / profit_per_expo
+        expo_used_total = min(expo_avail, expo_needed)
+        if expo_used_total <= 0:
+            continue
+
+        donor_rw = float(DONOR_RISK_WEIGHT.get(d, 0.0))
+        red_per_eur = donor_rw * eff
+        if red_per_eur <= 0:
+            continue
+
+        w_norm = donor_receiver_weights.get(d, {})
+        cells = cells_by_donor[d]
+
+        for cell in cells:
+            r = cell.receiver
+            w = float(w_norm.get(r, 0.0))
+            if w <= 0:
+                continue
+
+            expo_used = expo_used_total * w
+            rwa_red = expo_used * red_per_eur
+            assets_redeploy = rwa_red / float(cell.receiver_risk_weight)
+            contrib = expo_used * float(cell.delta_s_eff_dec) * (1.0 - tx)
+
+            allocs.append(
+                Allocation(
+                    donor=cell.donor,
+                    receiver=cell.receiver,
+                    exposure_used_eur_bn=expo_used,
+                    rwa_reduction_eur_bn=rwa_red,
+                    assets_redeploy_used_eur_bn=assets_redeploy,
+                    donor_risk_weight=cell.donor_risk_weight,
+                    receiver_risk_weight=cell.receiver_risk_weight,
+                    delta_rwa_pp=cell.delta_rwa_pp,
+                    abs_net_spread_bps=cell.abs_net_spread_bps,
+                    delta_s_eff_dec=cell.delta_s_eff_dec,
+                    ratio=cell.ratio,
+                )
+            )
+
+            total_expo += expo_used
+            total_rwa_red += rwa_red
+            total_assets_redeploy += assets_redeploy
+            total_profit += contrib
+
+        remaining_profit = max(0.0, profit_target - total_profit)
+
+    status = "OK" if remaining_profit <= 1e-9 else "TARGET_NOT_MET"
+    return {
+        "allocations": allocs,
+        "total_profit_eur_bn_yr": total_profit,
+        "total_rwa_reduction_eur_bn": total_rwa_red,
+        "total_exposure_used_eur_bn": total_expo,
+        "total_assets_redeploy_used_eur_bn": total_assets_redeploy,
+        "remaining_profit_target_eur_bn_yr": remaining_profit,
+        "ranked_donors": [(d, float(ppe), int(n)) for d, ppe, n in donor_rank],
+        "status": status,
+    }
+
+
 # Default donor exposure split (since CSV has no subsegment exposures)
 DEFAULT_DONOR_SPLIT_OF_TOTAL_ASSETS = {
     # Segment B donors
@@ -438,8 +626,59 @@ def donor_eligible_exposure_long(
             else:
                 cap_pct = 100.0
             expo_elig = expo * cap_pct / 100.0
+            expo_elig = expo_elig * float(ALLOCATOR_CAPACITY_MULTIPLIER)
             rows.append({"Bank": bank, "Donor": donor, "Eligible_Exposure_EUR_bn": expo_elig})
     return pd.DataFrame(rows)
+
+
+
+def compute_max_roe_uplift_map(
+    sim_df: pd.DataFrame,
+    banks_sel: pd.DataFrame,
+    override_srt_cost_bp: float | None = None,
+    override_tax_rate: float | None = None,
+    donor_availability_pct_by_donor: Optional[Dict[str, float]] = None,
+    receiver_split_by_donor: Optional[Dict[str, Dict[str, float]]] = None,
+    tol_pct: float = 0.5,
+) -> Dict[str, float]:
+    """Max annual ROE uplift (bp p.a.) per bank when *all* eligible donor capacity is used for redeployment.
+
+    Implementation mirrors the former 'Max. ROE uplift (bp)' column in the table under chart (3),
+    but returns a dict so it can be used for visualization (chart 2).
+    """
+    try:
+        if sim_df is None or sim_df.empty or banks_sel is None or banks_sel.empty:
+            return {}
+
+        sim_df_max = sim_df.copy()
+        # Oversize the RWA reduction targets so the allocator becomes capacity-constrained.
+        sim_df_max["Effective_RWA_Reduction_EUR_bn_Tot"] = 1e12
+        sim_df_max["Gross_RWA_Offload_EUR_bn_Tot"] = 1e12
+
+        roe_df_maxcap = compute_roe_delta_transitions_greedy(
+            sim_df_max,
+            banks_sel,
+            roe_target_bp=1e6,  # very high target -> exhaust redeployment capacity
+            apply_roe_target=True,
+            override_srt_cost_bp=override_srt_cost_bp,
+            override_tax_rate=override_tax_rate,
+            require_exact_target=False,
+            target_tolerance_pct=float(tol_pct),
+            donor_availability_pct_by_donor=donor_availability_pct_by_donor,
+            receiver_split_by_donor=receiver_split_by_donor,
+        )
+
+        if not isinstance(roe_df_maxcap, pd.DataFrame) or roe_df_maxcap.empty:
+            return {}
+
+        return (
+            roe_df_maxcap.groupby("Bank", dropna=False)["ROE_delta_bp"]
+            .max()
+            .astype(float)
+            .to_dict()
+        )
+    except Exception:
+        return {}
 
 def build_donor_exposures_from_total_assets(
     total_assets_eur_bn: float,
@@ -522,8 +761,8 @@ def simulate_offload(years: int, banks_df: pd.DataFrame, scenarios_bps: dict, sr
 def compute_roe_delta_transitions_greedy(
     sim_df: pd.DataFrame,
     banks_df: pd.DataFrame,
-    util: float,
-    apply_util_target_scaling: bool = True,
+    roe_target_bp: float,
+    apply_roe_target: bool = True,
     override_srt_cost_bp: float | None = None,
     override_tax_rate: float | None = None,
     donor_split_override_by_bank: Optional[Dict[str, Dict[str, float]]] = None,
@@ -595,33 +834,37 @@ def compute_roe_delta_transitions_greedy(
         rwa_target_yr_base = float(eff_per_year[i]) if np.isfinite(eff_per_year[i]) else 0.0
 
         # Two-step allocation:
-        #   Step 1 (Redeployment): allocate the RWAs needed to support redeployment into new assets.
+        #   Step 1 (Redeployment): allocate donor exposure until the *ROE / profit target* is met.
         #   Step 2 (CET1 uplift): allocate the RWAs required for CET1 uplift, *after* Step 1 has consumed capacity.
         #
-        # Profit / ROE uplift must be computed from Step 1 only.
-        util_dec = float(util) if util is not None else 0.0
-        if not np.isfinite(util_dec):
-            util_dec = 0.0
-        util_dec = max(min(util_dec, 0.999999), 0.0)
-
+        # Profit / ROE uplift is computed from Step 1 only.
+        #
         # Base (annual effective) CET1-uplift requirement:
         rwa_target_cet1_yr = rwa_target_yr_base
 
-        # Redeployment requires additional RWAs; factor = util/(1-util).
-        if apply_util_target_scaling and util_dec > 0:
-            target_scale = (1.0 / (1.0 - util_dec)) - 1.0  # = util_dec/(1-util_dec)
-            rwa_target_redeploy_yr = rwa_target_yr_base * target_scale
-        else:
-            target_scale = 0.0
-            rwa_target_redeploy_yr = 0.0
+        # ROE target (bp) -> annual profit target (EUR bn / yr)
+        try:
+            roe_target_bp_i = float(roe_target_bp)
+        except Exception:
+            roe_target_bp_i = 0.0
+        if not np.isfinite(roe_target_bp_i):
+            roe_target_bp_i = 0.0
+        roe_target_bp_i = max(roe_target_bp_i, 0.0)
 
-        # Total RWA reduction volume that consumes transition capacity:
-        rwa_target_total_yr = rwa_target_redeploy_yr + rwa_target_cet1_yr
+        cet1_cap_bn = float(row.get("CET1_Capital_EUR_bn", np.nan))
+        if not np.isfinite(cet1_cap_bn) or cet1_cap_bn <= 0:
+            profit_target_redeploy_yr = 0.0
+        else:
+            profit_target_redeploy_yr = (roe_target_bp_i / 10000.0) * cet1_cap_bn
+
+        # For reporting: Step 1 does not have an RWA target anymore (it's profit-driven).
+        rwa_target_redeploy_yr = 0.0
+        rwa_target_total_yr = rwa_target_cet1_yr
 
         # store targets for reporting (aligned with df rows)
-        rwa_target_base_yr_list.append(rwa_target_yr_base)     # CET1 portion (base)
-        rwa_target_scaled_yr_list.append(rwa_target_total_yr)  # total capacity-consuming volume
-        rwa_target_scale_list.append(target_scale)             # redeployment factor only
+        rwa_target_base_yr_list.append(rwa_target_yr_base)  # CET1 portion (base)
+        rwa_target_scaled_yr_list.append(rwa_target_total_yr)  # placeholder; updated after Step 1
+        rwa_target_scale_list.append(0.0)  # placeholder; updated after Step 1
 
         total_assets_bn = float(assets_total.get(bank, np.nan))
         if not np.isfinite(total_assets_bn) or total_assets_bn <= 0:
@@ -658,7 +901,22 @@ def compute_roe_delta_transitions_greedy(
                 if np.isfinite(pct_f):
                     donor_expo[_d] = donor_expo[_d] * max(min(pct_f, 100.0), 0.0) / 100.0
 
-        # Parse SRT efficiency string like "75%" -> 0.75
+        
+        # --- STOCK ASSUMPTION FOR DONOR ASSETS ---
+        # donor_expo is a *stock* of eligible donor assets (EUR bn). To avoid "re-using" the same assets every year,
+        # we spread this stock evenly across the horizon when running the annual transition engine.
+        # (If you want a rolling-book replenishment assumption, this is the line to revisit.)
+        try:
+            _yrs_i = float(row.get("Years", years))
+        except Exception:
+            _yrs_i = float(years) if "years" in globals() else 1.0
+        _yrs_i = max(_yrs_i, 1.0)
+        donor_expo = {k: float(v) / _yrs_i for k, v in donor_expo.items()}
+
+        # Increase allocator capacity (e.g., to model additional replenishment / more balance-sheet room)
+        donor_expo = {k: float(v) * float(ALLOCATOR_CAPACITY_MULTIPLIER) for k, v in donor_expo.items()}
+
+# Parse SRT efficiency string like "75%" -> 0.75
         srt_eff_str = str(row.get("SRT_Efficiency", "")).replace("%", "").strip()
         try:
             srt_eff_i = float(srt_eff_str) / 100.0
@@ -669,18 +927,28 @@ def compute_roe_delta_transitions_greedy(
         sc_i_pre = float(sc.iloc[i]) if hasattr(sc, "iloc") else float(sc)
 
         # ------------------------------
-        # Step 1: Redeployment allocation
+        # Step 1: Redeployment allocation (profit-target driven)
         # ------------------------------
-        alloc_redeploy = allocate_rwa_reduction_equal_receivers(
-            rwa_target_redeploy_yr, donor_expo, srt_eff_i, sc_i_pre,
+        tx_i = float(tx.iloc[i]) if hasattr(tx, "iloc") else float(tx)
+        alloc_redeploy = allocate_until_profit_target(
+            profit_target_redeploy_yr,
+            donor_expo,
+            srt_eff_i,
+            sc_i_pre,
+            tax_dec=tx_i,
             receiver_split_by_donor=receiver_split_by_donor,
-            donor_availability_pct_by_donor=donor_availability_pct_by_donor
+            donor_availability_pct_by_donor=donor_availability_pct_by_donor,
         )
 
         achieved_redeploy = float(alloc_redeploy["total_rwa_reduction_eur_bn"])
         expo_used_redeploy = float(alloc_redeploy["total_exposure_used_eur_bn"])
         assets_redeploy_used = float(alloc_redeploy["total_assets_redeploy_used_eur_bn"])
+        profit_redeploy = float(alloc_redeploy.get("total_profit_eur_bn_yr", 0.0))
         status_redeploy = str(alloc_redeploy["status"])
+
+        # Update reporting targets now that Step 1 (profit-driven) RWA volume is known
+        rwa_target_scaled_yr_list[-1] = float(rwa_target_cet1_yr + achieved_redeploy)
+        rwa_target_scale_list[-1] = float(achieved_redeploy / rwa_target_cet1_yr) if rwa_target_cet1_yr > 0 else 0.0
 
         # Net out donor exposure already consumed in Step 1
         used_by_donor = {}
@@ -710,31 +978,43 @@ def compute_roe_delta_transitions_greedy(
         expo_used_total = expo_used_redeploy + expo_used_cet1
 
         # ------------------------------
-        # Target compliance checks (TOTAL)
+        # Target compliance checks
         # ------------------------------
-        if rwa_target_total_yr > 0:
-            gap_pct = abs(achieved_total - rwa_target_total_yr) / rwa_target_total_yr * 100.0 if achieved_total > 0 else 100.0
+        if rwa_target_cet1_yr > 0:
+            cet1_gap_pct = abs(achieved_cet1 - rwa_target_cet1_yr) / rwa_target_cet1_yr * 100.0 if achieved_cet1 > 0 else 100.0
         else:
-            gap_pct = 0.0
+            cet1_gap_pct = 0.0
 
-        # Compose a status that reflects both steps
+        if np.isfinite(cet1_cap_bn) and cet1_cap_bn > 0:
+            roe_achieved_bp = (profit_redeploy / cet1_cap_bn) * 10000.0
+        else:
+            roe_achieved_bp = 0.0
+
+        roe_gap_bp = roe_achieved_bp - roe_target_bp_i
+
+        # Compose a status that reflects both targets
         status = "OK"
-        if (rwa_target_redeploy_yr > 0) and (status_redeploy != "OK"):
-            status = f"REDEPLOY_{status_redeploy}"
-        if (rwa_target_cet1_yr > 0) and (status_cet1 != "OK"):
+
+        # Step 1 (ROE) feasibility
+        if apply_roe_target and roe_target_bp_i > 0:
+            if status_redeploy != "OK":
+                status = f"ROE_{status_redeploy}"
+            else:
+                if roe_gap_bp < -1e-6:
+                    status = "ROE_TARGET_NOT_MET"
+
+        # Step 2 (CET1) feasibility / tolerance
+        if rwa_target_cet1_yr > 0 and status_cet1 != "OK":
             status = f"{status}_CET1_{status_cet1}" if status != "OK" else f"CET1_{status_cet1}"
 
-        if require_exact_target and (abs(achieved_total - rwa_target_total_yr) > 1e-9):
-            status = "EXACT_TARGET_NOT_MET"
-
-        if (not require_exact_target) and (rwa_target_total_yr > 0) and (gap_pct > target_tolerance_pct):
-            status = f"{status}_OUTSIDE_TOL({gap_pct:.2f}%)"
+        if (not require_exact_target) and (rwa_target_cet1_yr > 0) and (cet1_gap_pct > target_tolerance_pct):
+            status = f"{status}_CET1_OUTSIDE_TOL({cet1_gap_pct:.2f}%)"
 
         # ------------------------------
         # Profit calculation (Step 1 ONLY)
         # ------------------------------
         sc_i = float(sc.iloc[i]) if hasattr(sc, "iloc") else float(sc)
-        tx_i = float(tx.iloc[i]) if hasattr(tx, "iloc") else float(tx)
+        # tx_i already computed above for Step 1.
         lever_i = float(lever_penalty.iloc[i]) if hasattr(lever_penalty, "iloc") else float(lever_penalty)
 
         profit = 0.0
@@ -812,6 +1092,9 @@ def compute_roe_delta_transitions_greedy(
         "Scenario", "SRT_Efficiency", "Years",
         "CET1_Capital_EUR_bn",
         "RWA_reduction_achieved_Yr",
+        "RWA_target_base_Yr",
+        "RWA_target_scaled_Yr",
+        "RWA_target_scale",
         "Assets_redeploy_used_Yr",
         "ROE_delta_bp",
         "gross_eff_lever",
@@ -1024,28 +1307,26 @@ with _tc1:
 
     st.markdown("---")
 
-    st.subheader("Scenario (US advantage in bps)")
+    st.subheader("Scenario")
     scenario_bps = st.slider(
-        "US advantage (bp)",
-        min_value=1,
+        "CET1-uplift target (bp over horizon)",
+        min_value=0,
         max_value=400,
         value=168,
         step=1,
-        help="Required CET1-uplift in basis points to compensate for US regulatory advantage",
+        help="Annual CET1-uplift target in basis points",
     )
 
-    
-
-    # Redeployment / CET1-Split — moved below US advantage in left column
-    util = st.slider("Redeployment / CET1-Split (%)",
-        min_value=0.0,
-        max_value=99.9,
-        value=50.0,
-        step=0.1,
-        format="%.1f",
-        help="This slider lets you choose the share of the RWAs to be redeployed while maintaining your CET1-upflift target (= US advantage (bp), see slider above). E.g. 75% means freed RWAs are calculated such that 100%-75% = 25% of freed RWAs can be reserved for the desired CET1-uplift, while the other 75% of freed RWAs can be used for redeployment into return-producing assets.",
-        key="util_slider",
-    ) / 100.0
+    # Target ROE uplift (bp) — replaces the old Redeployment/CET1 split slider
+    roe_target_bp = st.slider(
+        "Annual ROE-uplift target (bps)",
+        min_value=0,
+        max_value=600,
+        value=100,
+        step=1,
+        help="Target annual ROE uplift in basis points (bp). The model first allocates donor capacity to meet this ROE target (via profit-generating redeployment) and then allocates additional capacity to meet the CET1-uplift target.",
+        key="roe_target_slider",
+    )
 
 
 with _tc1:
@@ -1466,8 +1747,8 @@ sim_port = simulate_offload(years, portfolio_df, scenarios, effs)
 roe_port = compute_roe_delta_transitions_greedy(
     sim_port,
     portfolio_df,
-    util=util,
-    apply_util_target_scaling=True,
+    roe_target_bp=roe_target_bp,
+    apply_roe_target=True,
     override_srt_cost_bp=override_srt_cost_bp,
     override_tax_rate=override_tax_rate,
     require_exact_target=require_exact,
@@ -1480,8 +1761,8 @@ roe_port = compute_roe_delta_transitions_greedy(
 roe_port_base = compute_roe_delta_transitions_greedy(
     sim_port,
     portfolio_df,
-    util=util,
-    apply_util_target_scaling=False,
+    roe_target_bp=roe_target_bp,
+    apply_roe_target=False,
     override_srt_cost_bp=override_srt_cost_bp,
     override_tax_rate=override_tax_rate,
     require_exact_target=require_exact,
@@ -1496,8 +1777,8 @@ sim_df = simulate_offload(years, banks_sel, scenarios, effs)
 roe_df = compute_roe_delta_transitions_greedy(
     sim_df,
     banks_sel,
-    util=util,
-    apply_util_target_scaling=True,
+    roe_target_bp=roe_target_bp,
+    apply_roe_target=True,
     override_srt_cost_bp=override_srt_cost_bp,
     override_tax_rate=override_tax_rate,
     require_exact_target=require_exact,
@@ -1510,8 +1791,8 @@ roe_df = compute_roe_delta_transitions_greedy(
 roe_df_base = compute_roe_delta_transitions_greedy(
     sim_df,
     banks_sel,
-    util=util,
-    apply_util_target_scaling=False,
+    roe_target_bp=roe_target_bp,
+    apply_roe_target=False,
     override_srt_cost_bp=override_srt_cost_bp,
     override_tax_rate=override_tax_rate,
     require_exact_target=require_exact,
@@ -1526,26 +1807,43 @@ sri_df = compute_sri(sim_df, banks_sel)
 def _attach_transition_based_assets(sim: pd.DataFrame, roe: pd.DataFrame) -> pd.DataFrame:
     """Attach transition-based asset offload columns to the simple simulation output.
 
-    Transition-based (donor RW) assets offloaded are computed as:
+    We compute *step-wise* transition-based assets offloaded using the allocation audit trail:
 
-      Step 1: aggregate annual RWA contributions by donor:
-              RWA_d = sum_{allocations in row and donor d} RWA_reduction_EUR_bn_Yr
-      Step 2: convert each donor RWA to assets using donor RW:
-              Assets_net = sum_d (RWA_d / Donor_RW_d)
-      Step 3: gross-up by dividing by efficiency:
-              Assets_gross = Assets_net / efficiency
+      - ROE step  ("REDEPLOY")
+      - CET1 step ("CET1")
 
-    The result is attached as:
-      - Assets_Offloaded_Transition_EUR_bn_Yr
-      - Assets_Offloaded_Transition_EUR_bn_Tot
+    For each step:
+      1) Aggregate annual RWA reduction by donor:
+           RWA_d = sum_{allocations in step, row-key, donor d} RWA_reduction_EUR_bn_Yr
+      2) Convert donor RWA to net assets using donor RW:
+           Assets_net_step = sum_d (RWA_d / Donor_RW_d)
+      3) Gross-up by SRT efficiency:
+           Assets_gross_step = Assets_net_step / efficiency
+
+    Columns attached (EUR bn):
+      - Assets_Offloaded_ROE_Transition_EUR_bn_Yr / _Tot
+      - Assets_Offloaded_CET1_Transition_EUR_bn_Yr / _Tot
+      - Assets_Offloaded_Transition_EUR_bn_Yr / _Tot   (sum of both steps)
+
+    In addition, we merge back the endogenous scaling outputs from the ROE engine:
+      - RWA_target_base_Yr
+      - RWA_target_scaled_Yr
+      - RWA_target_scale
     """
     sim = sim.copy()
 
     # Ensure we don't create duplicate columns when merging (avoid _x/_y suffixes)
     sim = sim.drop(columns=[
+        "Assets_Offloaded_ROE_Transition_EUR_bn_Yr",
+        "Assets_Offloaded_ROE_Transition_EUR_bn_Tot",
+        "Assets_Offloaded_CET1_Transition_EUR_bn_Yr",
+        "Assets_Offloaded_CET1_Transition_EUR_bn_Tot",
         "Assets_Offloaded_Transition_EUR_bn_Yr",
         "Assets_Offloaded_Transition_EUR_bn_Tot",
         "Assets_Offloaded_Transition_net_EUR_bn_Yr",
+        "RWA_target_base_Yr",
+        "RWA_target_scaled_Yr",
+        "RWA_target_scale",
     ], errors="ignore")
 
     if roe is None or roe.empty:
@@ -1553,52 +1851,108 @@ def _attach_transition_based_assets(sim: pd.DataFrame, roe: pd.DataFrame) -> pd.
 
     audit = roe.attrs.get("allocations_audit_df")
     if not isinstance(audit, pd.DataFrame) or audit.empty:
+        # Still merge the scaling outputs if present in roe
+        key = ["Bank", "Scenario", "SRT_Efficiency", "Years"]
+        back_cols = [c for c in ["RWA_target_base_Yr", "RWA_target_scaled_Yr", "RWA_target_scale"] if c in roe.columns]
+        if back_cols:
+            sim = sim.merge(roe[key + back_cols], on=key, how="left")
         return sim
 
     key = ["Bank", "Scenario", "SRT_Efficiency", "Years"]
 
-    # Aggregate RWA contributions by donor within each (Bank, Scenario, Efficiency, Years)
+    # Aggregate by (row-key, step, donor)
     grp = (
-        audit.groupby(key + ["Donor"], dropna=False)["RWA_reduction_EUR_bn_Yr"]
+        audit.groupby(key + ["Step", "Donor"], dropna=False)["RWA_reduction_EUR_bn_Yr"]
         .sum()
         .reset_index()
     )
 
-    # Map donor RW and convert donor RWA to assets
+    # Convert donor RWA to net assets using donor RW
     grp["Donor_RW"] = grp["Donor"].map(DONOR_RISK_WEIGHT).astype(float)
     grp.loc[grp["Donor_RW"] <= 0, "Donor_RW"] = np.nan
     grp["Assets_net_from_donor"] = grp["RWA_reduction_EUR_bn_Yr"] / grp["Donor_RW"]
 
-    # Sum assets across donors per row-key
-    assets_net = (
-        grp.groupby(key, dropna=False)["Assets_net_from_donor"]
+    # Sum across donors within each step
+    assets_net_step = (
+        grp.groupby(key + ["Step"], dropna=False)["Assets_net_from_donor"]
         .sum()
         .reset_index()
         .rename(columns={"Assets_net_from_donor": "Assets_Offloaded_Transition_net_EUR_bn_Yr"})
     )
 
-    # Parse efficiency and gross-up
-    eff_dec = assets_net["SRT_Efficiency"].astype(str).str.replace("%", "", regex=False).astype(float) / 100.0
+    # Efficiency gross-up (same per row-key)
+    eff_dec = assets_net_step["SRT_Efficiency"].astype(str).str.replace("%", "", regex=False).astype(float) / 100.0
     eff_dec = eff_dec.replace(0.0, np.nan)
-    assets_net["Assets_Offloaded_Transition_EUR_bn_Yr"] = assets_net["Assets_Offloaded_Transition_net_EUR_bn_Yr"] / eff_dec
-    assets_net["Assets_Offloaded_Transition_EUR_bn_Tot"] = assets_net["Assets_Offloaded_Transition_EUR_bn_Yr"] * assets_net["Years"].astype(float)
+    assets_net_step["Assets_Offloaded_Transition_EUR_bn_Yr"] = assets_net_step["Assets_Offloaded_Transition_net_EUR_bn_Yr"] / eff_dec
+    assets_net_step["Assets_Offloaded_Transition_EUR_bn_Tot"] = assets_net_step["Assets_Offloaded_Transition_EUR_bn_Yr"] * assets_net_step["Years"]
 
-    # Merge back to sim
-    sim = sim.merge(
-        assets_net[key + ["Assets_Offloaded_Transition_EUR_bn_Yr", "Assets_Offloaded_Transition_EUR_bn_Tot"]],
-        on=key,
-        how="left",
+    # Pivot step-wise columns
+    piv = assets_net_step.pivot_table(
+        index=key,
+        columns="Step",
+        values=["Assets_Offloaded_Transition_EUR_bn_Yr", "Assets_Offloaded_Transition_EUR_bn_Tot"],
+        aggfunc="sum",
+        dropna=False,
     )
+
+    # Flatten columns
+    piv.columns = [f"{m}_{s}" for (m, s) in piv.columns]
+    piv = piv.reset_index()
+
+    # Map to friendly names
+    rename_map = {
+        "Assets_Offloaded_Transition_EUR_bn_Yr_REDEPLOY": "Assets_Offloaded_ROE_Transition_EUR_bn_Yr",
+        "Assets_Offloaded_Transition_EUR_bn_Tot_REDEPLOY": "Assets_Offloaded_ROE_Transition_EUR_bn_Tot",
+        "Assets_Offloaded_Transition_EUR_bn_Yr_CET1": "Assets_Offloaded_CET1_Transition_EUR_bn_Yr",
+        "Assets_Offloaded_Transition_EUR_bn_Tot_CET1": "Assets_Offloaded_CET1_Transition_EUR_bn_Tot",
+    }
+    piv = piv.rename(columns=rename_map)
+
+    # Ensure missing step columns exist
+    for c in [
+        "Assets_Offloaded_ROE_Transition_EUR_bn_Yr",
+        "Assets_Offloaded_ROE_Transition_EUR_bn_Tot",
+        "Assets_Offloaded_CET1_Transition_EUR_bn_Yr",
+        "Assets_Offloaded_CET1_Transition_EUR_bn_Tot",
+    ]:
+        if c not in piv.columns:
+            piv[c] = 0.0
+
+    # Total offload (sum of steps)
+    piv["Assets_Offloaded_Transition_EUR_bn_Yr"] = piv["Assets_Offloaded_ROE_Transition_EUR_bn_Yr"] + piv["Assets_Offloaded_CET1_Transition_EUR_bn_Yr"]
+    piv["Assets_Offloaded_Transition_EUR_bn_Tot"] = piv["Assets_Offloaded_ROE_Transition_EUR_bn_Tot"] + piv["Assets_Offloaded_CET1_Transition_EUR_bn_Tot"]
+
+    # Merge scaling outputs from roe table
+    back_cols = [c for c in ["RWA_target_base_Yr", "RWA_target_scaled_Yr", "RWA_target_scale"] if c in roe.columns]
+    roe_back = roe[key + back_cols].drop_duplicates() if back_cols else roe[key].drop_duplicates()
+
+    sim = sim.merge(piv[key + [
+        "Assets_Offloaded_ROE_Transition_EUR_bn_Yr",
+        "Assets_Offloaded_ROE_Transition_EUR_bn_Tot",
+        "Assets_Offloaded_CET1_Transition_EUR_bn_Yr",
+        "Assets_Offloaded_CET1_Transition_EUR_bn_Tot",
+        "Assets_Offloaded_Transition_EUR_bn_Yr",
+        "Assets_Offloaded_Transition_EUR_bn_Tot",
+    ]], on=key, how="left")
+
+    sim = sim.merge(roe_back, on=key, how="left")
+
+    # Fill NaNs produced by missing steps/keys
+    for c in [
+        "Assets_Offloaded_ROE_Transition_EUR_bn_Yr",
+        "Assets_Offloaded_ROE_Transition_EUR_bn_Tot",
+        "Assets_Offloaded_CET1_Transition_EUR_bn_Yr",
+        "Assets_Offloaded_CET1_Transition_EUR_bn_Tot",
+        "Assets_Offloaded_Transition_EUR_bn_Yr",
+        "Assets_Offloaded_Transition_EUR_bn_Tot",
+    ]:
+        sim[c] = sim[c].fillna(0.0)
+
     return sim
 
 
-sim_df = _attach_transition_based_assets(sim_df, roe_df_base)
-sim_port = _attach_transition_based_assets(sim_port, roe_port_base)
-
- 
-# ============================================================
-# Charts
-# ============================================================
+# Attach step-wise transition-based offload columns for Chart 1/3 (CET1 vs ROE split)
+sim_df = _attach_transition_based_assets(sim_df, roe_df)
 
 # ---------------- Top controls (formerly sidebar) ----------------
 # Render controls in a true horizontal "header" layout (3 columns).
@@ -1634,206 +1988,387 @@ left_col = st.container()  # charts area (controls moved to top header)
 
 
 with left_col:
-    # Place "1) Offload (Simple)" and "2) Offload Complex (ΔROE)" side by side
-    c1, c2 = st.columns(2, gap="large")
+    top_left, top_right = st.columns(2, gap="large")
 
-    with c1:
-        st.subheader("1) Total Asset Offload")
+    with top_left:
+        st.subheader("1) CET1-Uplift (end-state)")
 
-        # Fixed offload display settings (sidebar toggles removed)
-        yv_simple = "Assets_Offloaded_Transition_EUR_bn_Tot"
-        yl_simple = "Assets offloaded (EUR bn, total, transition-based)"
+        # CET1 uplift is a level (stock) change. It does not "cumulate" the way ROE does.
+        # Filled bars show the end-state CET1 uplift target (bp).
+        # Light-grey outline shows remaining headroom up to the max-capacity cap (Max. Reg. Divergence, bp).
 
-        # --- Redeployment / CET1-Split slider effect on simple offload chart ---
-        # We stack an additional bar segment on top of each bank's base bar.
-        # Factor requested: base * (util/(1-util)). Example util=75% => factor=3x.
-        if util >= 1.0:
-            st.warning("Redeployment is set to 100%. The stacked factor becomes undefined (division by zero). Using 99.9% for display.")
-        _util_disp = min(float(util), 0.999)
-        _factor = _util_disp / (1.0 - _util_disp)  # == (1/(1-util) - 1)
+        def _compute_cet1_target_df():
+            base_cols = [c for c in ["Scenario", "SRT_Efficiency", "Bank", "Years"] if c in sim_df.columns]
+            base = sim_df[base_cols].drop_duplicates().copy()
+            if "Years" not in base.columns:
+                base["Years"] = float(years) if "years" in globals() else 1.0
+            try:
+                tgt = float(scenario_bps)
+            except Exception:
+                tgt = 0.0
+            base["CET1_target_bp"] = tgt
+            return base[["Scenario", "SRT_Efficiency", "Bank", "Years", "CET1_target_bp"]]
 
-        # Build a stacked-bar figure where each bank is its own offsetgroup so stacks don't mix across banks.
-        fig1 = go.Figure()
+        def _compute_max_reg_divergence_map_endstate():
+            try:
+                donor_elig_long = donor_eligible_exposure_long(
+                    banks_sel,
+                    donor_availability_pct_by_donor=donor_availability_pct,
+                    donor_split_override_by_bank=donor_split_override,
+                )
+                elig_lookup = {(str(r["Bank"]), str(r["Donor"])): float(r.get("Eligible_Exposure_EUR_bn", 0.0) or 0.0) for _, r in donor_elig_long.iterrows()}
+            except Exception:
+                elig_lookup = {}
 
-        # Keep stable ordering for x
-        scenarios_order = sim_df["Scenario"].astype(str).dropna().unique().tolist()
+            yrs_i = float(years) if "years" in globals() else 1.0
+            yrs_i = max(1.0, yrs_i)
 
-        for bank in BANK_ORDER:
-            d = sim_df[sim_df["Bank"] == bank]
-            if d.empty:
-                continue
-            # Map scenario -> base value
-            base_map = {str(r["Scenario"]): float(r.get(yv_simple, 0.0) or 0.0) for _, r in d.iterrows()}
-            base_vals = [base_map.get(str(sc), 0.0) for sc in scenarios_order]
-            top_vals = [v * _factor for v in base_vals]
+            cap_map = {}
+            for _, b in banks_sel.iterrows():
+                bank = str(b["Bank Name"])
+                R = float(b["Total RWA (EUR bn)"])
+                cet1_ratio = float(b["CET1 Ratio (%)"]) / 100.0
+                C = cet1_ratio * R
 
-            color = BANK_COLOR_MAP.get(bank)
+                donor_expo = {
+                    "B1_SME_TERM": elig_lookup.get((bank, "B1_SME_TERM"), 0.0),
+                    "B1_MIDCORP_NONIG": elig_lookup.get((bank, "B1_MIDCORP_NONIG"), 0.0),
+                    "B1_EM_CORP": elig_lookup.get((bank, "B1_EM_CORP"), 0.0),
+                    "B1_CRE_NON_HVCRE": elig_lookup.get((bank, "B1_CRE_NON_HVCRE"), 0.0),
+                }
 
-            # Base (old) bar
-            fig1.add_trace(
-                go.Bar(
-                    name=bank,
-                    x=scenarios_order,
-                    y=base_vals,
-                    marker_color=color,
-                    offsetgroup=bank,
-                    legendgroup=bank,
+                srt_eff_dec = float(srt_eff) if "srt_eff" in globals() else 0.75
+
+                try:
+                    alloc_cap = allocate_rwa_reduction_equal_receivers(
+                        1e12, donor_expo, srt_eff_dec, 0.0,
+                        donor_availability_pct_by_donor=donor_availability_pct,
+                    )
+                    eff_max_yr = float(alloc_cap.get("total_rwa_reduction_eur_bn", 0.0) or 0.0)
+                except Exception:
+                    eff_max_yr = 0.0
+
+                eff_max_tot = float(eff_max_yr)  # donor stock (no x years)
+                eff_rwa_tot = min(float(eff_max_tot), max(R - 1e-9, 0.0))
+
+                if eff_rwa_tot <= 0 or (R - eff_rwa_tot) <= 0:
+                    cap_bp = np.nan
+                else:
+                    target_ratio = C / (R - eff_rwa_tot)
+                    cap_bp = (target_ratio - cet1_ratio) * 10000.0
+
+                cap_map[str(bank).strip()] = cap_bp
+
+            return cap_map
+
+        def _plot_cet1_endstate():
+            df = _compute_cet1_target_df()
+            if df.empty:
+                return go.Figure().update_layout(title="CET1 uplift target – Banks (transition-based)")
+
+            scenarios_order = df["Scenario"].astype(str).dropna().unique().tolist()
+            cap_map = {str(k).strip(): v for k, v in (_compute_max_reg_divergence_map_endstate() or {}).items()}
+            banks_in_df = df["Bank"].astype(str).dropna().unique().tolist()
+
+            fig = go.Figure()
+            for bank in banks_in_df:
+                d = df[df["Bank"].astype(str).str.strip() == str(bank).strip()]
+                if d.empty:
+                    continue
+
+                cur_map = {str(r["Scenario"]): float(r.get("CET1_target_bp", 0.0) or 0.0) for _, r in d.iterrows()}
+                cur_vals = [cur_map.get(str(sc), 0.0) for sc in scenarios_order]
+
+                max_val = float(cap_map.get(str(bank).strip(), np.nan))
+                pot_vals = [max(max_val - float(v), 0.0) for v in cur_vals] if np.isfinite(max_val) else [0.0 for _ in cur_vals]
+
+                color = BANK_COLOR_MAP.get(bank)
+
+                fig.add_trace(
+                    go.Bar(
+                        name=bank,
+                        x=scenarios_order,
+                        y=cur_vals,
+                        marker_color=color,
+                        offsetgroup=bank,
+                        legendgroup=bank,
+                        showlegend=True,
+                    )
+                )
+
+                fig.add_trace(
+                    go.Bar(
+                        name=f"{bank} (potential)",
+                        x=scenarios_order,
+                        y=pot_vals,
+                        base=cur_vals,
+                        marker=dict(
+                            color="rgba(0,0,0,0)",
+                            line=dict(color="lightgrey", width=2),
+                        ),
+                        offsetgroup=bank,
+                        legendgroup=bank,
+                        showlegend=False,
+                    )
+                )
+
+            fig.add_trace(
+                go.Scatter(
+                    x=[None],
+                    y=[None],
+                    mode="lines",
+                    line=dict(color="lightgrey", width=2),
+                    name="CET1 potential (max-capacity)",
                     showlegend=True,
                 )
             )
 
-            # Stacked top segment (new)
-            fig1.add_trace(
-                go.Bar(
-                    name=f"{bank} (redeployment)",
-                    x=scenarios_order,
-                    y=top_vals,
-                    marker_color=color,
-                    marker_opacity=0.35,
-                    offsetgroup=bank,
-                    legendgroup=bank,
-                    showlegend=False,
-                )
+            fig.update_layout(
+                barmode="group",
+                title="CET1 uplift target (bp) – Banks (transition-based)",
+                legend_title_text="Bank",
+                legend_orientation="v",
+                legend_yanchor="top",
+                legend_y=1,
+                legend_xanchor="left",
+                legend_x=1.02,
             )
+            fig.update_yaxes(title_text="ΔCET1 ratio (bp, end-state)")
+            fig.update_xaxes(title_text="")
+            return fig
 
-        fig1.update_layout(
-            barmode="stack",
-            title="Required offload (transition-based assets) + redeployment stack",
-            legend_title_text="Bank",
-            legend_orientation="v",
-            legend_yanchor="top",
-            legend_y=1,
-            legend_xanchor="left",
-            legend_x=1.02,
-        )
-        fig1.update_yaxes(title_text=yl_simple)
-        fig1.update_xaxes(title_text="")
-
-        st.plotly_chart(fig1, use_container_width=True)
-    with c2:
+        st.plotly_chart(_plot_cet1_endstate(), use_container_width=True)
+    with top_right:
         st.subheader("2) ROE-Uplift")
 
-        # Portfolio average ΔROE (weighted by CET1 capital proxy = Total RWA × CET1 ratio)
-        # Used as a horizontal reference line in the bank-level chart below.
+        # Two views: annual ΔROE (bp p.a.) vs cumulative over the horizon (bp * years)
+        tab_annual, tab_total = st.tabs(["Annual (bp p.a.)", "Total (bp over horizon)"])
+
+        # Prepare a working copy with a cumulative metric
+        roe_df_view = roe_df.copy()
+        if "Years" in roe_df_view.columns:
+            roe_df_view["ROE_delta_bp_Tot"] = roe_df_view["ROE_delta_bp"] * roe_df_view["Years"]
+        else:
+            # Fallback: if Years missing, treat total == annual (should not happen in normal runs)
+            roe_df_view["ROE_delta_bp_Tot"] = roe_df_view["ROE_delta_bp"]
+
+        # Portfolio average reference line uses a CET1-capital proxy weight
         _w = banks_sel[["Bank Name", "Total RWA (EUR bn)", "CET1 Ratio (%)"]].copy()
         _w["weight"] = _w["Total RWA (EUR bn)"] * _w["CET1 Ratio (%)"]
 
-        _tmp = roe_df.merge(_w[["Bank Name", "weight"]], left_on="Bank", right_on="Bank Name", how="left")
-        _tmp = _tmp.dropna(subset=["weight"])
+        def _plot_roe(y_col: str, y_label: str, title: str):
+            _tmp = roe_df_view.merge(_w[["Bank Name", "weight"]], left_on="Bank", right_on="Bank Name", how="left")
+            _tmp = _tmp.dropna(subset=["weight"])
 
-        roe_port_avg = (
-            _tmp.groupby(["Scenario", "SRT_Efficiency"], as_index=False)
-                .apply(lambda g: pd.Series({"ROE_delta_bp": float(np.average(g["ROE_delta_bp"], weights=g["weight"]))}))
-        )
+            roe_port_avg = (
+                _tmp.groupby(["Scenario", "SRT_Efficiency"], as_index=False)
+                    .apply(lambda g: pd.Series({y_col: float(np.average(g[y_col], weights=g["weight"]))}))
+            )
 
-        fig2 = px.bar(
-            roe_df,
-            x="Scenario",
-            y="ROE_delta_bp",
-            color="Bank",
-            barmode="group",
-            category_orders={"Bank": BANK_ORDER},
-            color_discrete_map=BANK_COLOR_MAP,
-            labels={"ROE_delta_bp": "ΔROE (bp p.a.)", "Scenario": "", "Bank": "Bank"},
-            title="ΔROE (bp p.a.) – Banks (transition-based)"
-        )
+            # --- Max-capacity ROE potential (outline) ---
+            max_roe_map = compute_max_roe_uplift_map(
+                sim_df=sim_df,
+                banks_sel=banks_sel,
+                override_srt_cost_bp=override_srt_cost_bp,
+                override_tax_rate=override_tax_rate,
+                donor_availability_pct_by_donor=donor_availability_pct,
+                receiver_split_by_donor=receiver_split_by_donor,
+                tol_pct=tol_pct,
+            )
 
-        # Add portfolio-average reference line(s) (one per SRT efficiency, if applicable)
-        # Use add_hline so the reference is visible even when there is only a single x-category.
-        if isinstance(roe_port_avg, pd.DataFrame) and not roe_port_avg.empty:
-            multi_eff = ("SRT_Efficiency" in roe_port_avg.columns) and (roe_port_avg["SRT_Efficiency"].nunique(dropna=False) > 1)
-            for _eff_key, g in roe_port_avg.groupby("SRT_Efficiency", dropna=False) if "SRT_Efficiency" in roe_port_avg.columns else [(None, roe_port_avg)]:
-                # Expect one value per scenario; if multiple scenarios exist, draw one hline per scenario.
-                for _scen, gg in g.groupby("Scenario", dropna=False) if "Scenario" in g.columns else [(None, g)]:
-                    y_val = float(gg["ROE_delta_bp"].iloc[0])
-                    label = f"Portfolio avg ({_eff_key})" if multi_eff else "Portfolio avg"
-                    if _scen not in (None, "") and (("Scenario" in roe_df.columns) and (roe_df["Scenario"].nunique() > 1)):
-                        label = f"{label} – {_scen}"
-                    fig2.add_hline(
-                        y=y_val,
-                        line_dash="dash",
-                        line_width=2
+            scenarios_order = roe_df_view["Scenario"].astype(str).dropna().unique().tolist()
+
+            fig = go.Figure()
+
+            for bank in BANK_ORDER:
+                d = roe_df_view[roe_df_view["Bank"] == bank]
+                if d.empty:
+                    continue
+
+                cur_map = {str(r["Scenario"]): float(r.get(y_col, 0.0) or 0.0) for _, r in d.iterrows()}
+                cur_vals = [cur_map.get(str(sc), 0.0) for sc in scenarios_order]
+
+                # Potential is computed as (max - current), clipped at 0.
+                max_ann = float(max_roe_map.get(bank, np.nan))
+                if np.isfinite(max_ann):
+                    if y_col == "ROE_delta_bp_Tot":
+                        # Total max scales with each row's Years (should be constant across the view).
+                        try:
+                            yrs = float(d["Years"].dropna().iloc[0])
+                        except Exception:
+                            yrs = float(years) if "years" in globals() else 1.0
+                        max_val = max_ann * yrs
+                    else:
+                        max_val = max_ann
+                    pot_vals = [max(max_val - float(v), 0.0) for v in cur_vals]
+                else:
+                    pot_vals = [0.0 for _ in cur_vals]
+
+                color = BANK_COLOR_MAP.get(bank)
+
+                # Filled bar = achieved ΔROE
+                fig.add_trace(
+                    go.Bar(
+                        name=bank,
+                        x=scenarios_order,
+                        y=cur_vals,
+                        marker_color=color,
+                        offsetgroup=bank,
+                        legendgroup=bank,
+                        showlegend=True,
                     )
-                    # Add a dummy trace so the portfolio-average line appears in the legend
-                    fig2.add_trace(
-                        go.Scatter(
-                            x=[None],
-                            y=[None],
-                            mode="lines",
-                            name="Portfolio avg",
-                            line=dict(dash="dash", width=2, color="black"),
-                            showlegend=True,
-                            hoverinfo="skip",
-                        )
-                    )
-
-        fig2.update_layout(
-            legend_title_text="Bank",
-            legend_orientation="v",
-            legend_yanchor="top",
-            legend_y=1,
-            legend_xanchor="left",
-            legend_x=1.02,
-        )
-        st.plotly_chart(fig2, use_container_width=True)
-    st.markdown("---")
-
-    # ---- Donor utilization (how much of eligible donor assets are used) ----
-    # Per-year utilization, capped at 100% (availability sliders are per-year caps).
-    audit_alloc = roe_df.attrs.get("allocations_audit_df")
-    if not isinstance(audit_alloc, pd.DataFrame) or audit_alloc.empty:
-        st.info("Donor utilization chart not available (allocation audit data missing).")
-    else:
-        # Filter to the currently selected scenario/efficiency/horizon to avoid accidental averaging
-        _scenario_key = list(scenarios.keys())[0] if isinstance(scenarios, dict) and scenarios else None
-        _eff_val = effs[0] if isinstance(effs, list) and effs else None
-
-        alloc_f = audit_alloc.copy()
-        if _scenario_key is not None and "Scenario" in alloc_f.columns:
-            alloc_f = alloc_f[alloc_f["Scenario"] == _scenario_key]
-        if _eff_val is not None and "SRT_Efficiency" in alloc_f.columns:
-            # Handle numeric or percentage-string representations (e.g. "75%")
-            eff_series = alloc_f["SRT_Efficiency"]
-            if eff_series.dtype == object:
-                eff_num = (
-                    eff_series.astype(str)
-                    .str.replace("%", "", regex=False)
-                    .str.strip()
-                    .astype(float) / 100.0
                 )
-            else:
-                eff_num = eff_series.astype(float)
 
-            alloc_f = alloc_f[np.isclose(eff_num, float(_eff_val))]
-        if "Years" in alloc_f.columns:
-            alloc_f = alloc_f[alloc_f["Years"] == years]
+                # Outline bar (stacked on top of the achieved value) = remaining potential up to max-capacity
+                fig.add_trace(
+                    go.Bar(
+                        name=f"{bank} (potential)",
+                        x=scenarios_order,
+                        y=pot_vals,
+                        base=cur_vals,
+                        marker=dict(
+                            color="rgba(0,0,0,0)",
+                            line=dict(color='lightgrey', width=2),
+                        ),
+                        offsetgroup=bank,
+                        legendgroup=bank,
+                        showlegend=False,
+                        hovertemplate=(
+                            "Scenario=%{x}<br>"
+                            + "Potential to max=%{y:.1f}<br>"
+                            + "<extra></extra>"
+                        ),
+                    )
+                )
 
-        # Annual exposure used per bank+donor (EUR bn per year)
-        donor_used_bank = (
-            alloc_f.groupby(["Bank", "Donor"], as_index=False)
-            .agg({"Exposure_used_EUR_bn_Yr": "sum"})
-        )
+            # Single legend entry explaining the outline
 
-        # Eligible donor exposure stock per bank+donor (EUR bn) after applying donor split + availability cap sliders
-        donor_elig = donor_eligible_exposure_long(
-            banks_sel,
-            donor_availability_pct_by_donor=donor_availability_pct,
-            donor_split_override_by_bank=donor_split_override,
-        )
+            fig.add_trace(
+                go.Scatter(
+                    x=[None],
+                    y=[None],
+                    mode="lines",
+                    line=dict(color='lightgrey', width=2),
+                    name="ROE potential (max-capacity)",
+                    showlegend=True,
+                )
+            )
 
-        donor_util = donor_used_bank.merge(donor_elig, on=["Bank", "Donor"], how="left")
+            fig.update_layout(
+                barmode="group",
+                title=title,
+                legend_title_text="Bank",
+                legend_orientation="v",
+                legend_yanchor="top",
+                legend_y=1,
+                legend_xanchor="left",
+                legend_x=1.02,
+            )
+            fig.update_yaxes(title_text=y_label)
+            fig.update_xaxes(title_text="")
+            return fig
 
-        # Per-year utilization (% of eligible stock used per year)
-        donor_util["Utilization_pct_Yr"] = (
-            100.0 * donor_util["Exposure_used_EUR_bn_Yr"] / donor_util["Eligible_Exposure_EUR_bn"]
-        )
-        donor_util.loc[donor_util["Eligible_Exposure_EUR_bn"] <= 0, "Utilization_pct_Yr"] = 0.0
-        donor_util["Utilization_pct_Yr"] = donor_util["Utilization_pct_Yr"].clip(lower=0, upper=100)
+        with tab_annual:
+            fig2_yr = _plot_roe(
+                y_col="ROE_delta_bp",
+                y_label="ΔROE (bp p.a.)",
+                title="ΔROE (bp p.a.) – Banks (transition-based)",
+            )
+            st.plotly_chart(fig2_yr, use_container_width=True)
 
-        # Sort for stable display
-        donor_util = donor_util.sort_values(["Donor", "Bank"])
+        with tab_total:
+            fig2_tot = _plot_roe(
+                y_col="ROE_delta_bp_Tot",
+                y_label="Cumulative ΔROE (bp over horizon)",
+                title="Cumulative ΔROE (bp over horizon) – Banks (transition-based)",
+            )
+            st.plotly_chart(fig2_tot, use_container_width=True)
 
-        st.markdown("### 3) Donor utilization – share of eligible donor assets used")
+    bottom_left, bottom_right = st.columns(2, gap="large")
+
+    with bottom_left:
+        st.subheader("3) Total Asset Offload")
+
+        # Two views: total over horizon vs annual (per year)
+        tab_annual, tab_total = st.tabs(["Annual (per year)", "Total (over horizon)"])
+
+        def _build_offload_fig(yv_cet1: str, yv_roe: str, y_label: str, title: str):
+            # Solid bars   = assets offloaded to achieve the CET1-uplift (Step "CET1")
+            # Transparent  = additional assets offloaded to achieve the ROE-uplift (Step "REDEPLOY")
+            fig = go.Figure()
+            scenarios_order = sim_df["Scenario"].astype(str).dropna().unique().tolist()
+
+            for bank in BANK_ORDER:
+                d = sim_df[sim_df["Bank"] == bank]
+                if d.empty:
+                    continue
+
+                cet1_map = {str(r["Scenario"]): float(r.get(yv_cet1, 0.0) or 0.0) for _, r in d.iterrows()}
+                roe_map  = {str(r["Scenario"]): float(r.get(yv_roe, 0.0) or 0.0)  for _, r in d.iterrows()}
+
+                base_vals = [cet1_map.get(str(sc), 0.0) for sc in scenarios_order]
+                top_vals  = [roe_map.get(str(sc), 0.0)  for sc in scenarios_order]
+
+                color = BANK_COLOR_MAP.get(bank)
+
+                fig.add_trace(
+                    go.Bar(
+                        name=bank,
+                        x=scenarios_order,
+                        y=base_vals,
+                        marker_color=color,
+                        offsetgroup=bank,
+                        legendgroup=bank,
+                        showlegend=True,
+                    )
+                )
+                fig.add_trace(
+                    go.Bar(
+                        name=bank,
+                        x=scenarios_order,
+                        y=top_vals,
+                        marker_color=color,
+                        opacity=0.35,
+                        offsetgroup=bank,
+                        legendgroup=bank,
+                        showlegend=False,
+                    )
+                )
+
+            fig.update_layout(
+                barmode="stack",
+                title=title,
+                legend_title_text="Bank",
+                legend_orientation="v",
+                legend_yanchor="top",
+                legend_y=1,
+                legend_xanchor="left",
+                legend_x=1.02,
+            )
+            fig.update_yaxes(title_text=y_label)
+            fig.update_xaxes(title_text="")
+            return fig
+
+        with tab_total:
+            fig1_tot = _build_offload_fig(
+                yv_cet1="Assets_Offloaded_CET1_Transition_EUR_bn_Tot",
+                yv_roe="Assets_Offloaded_ROE_Transition_EUR_bn_Tot",
+                y_label="Assets offloaded (EUR bn, total, transition-based)",
+                title="Required offload (transition-based assets): CET1 + ROE split (total over horizon)",
+            )
+            st.plotly_chart(fig1_tot, use_container_width=True)
+
+        with tab_annual:
+            fig1_yr = _build_offload_fig(
+                yv_cet1="Assets_Offloaded_CET1_Transition_EUR_bn_Yr",
+                yv_roe="Assets_Offloaded_ROE_Transition_EUR_bn_Yr",
+                y_label="Assets offloaded (EUR bn p.a., transition-based)",
+                title="Required offload (transition-based assets): CET1 + ROE split (annual)",
+            )
+            st.plotly_chart(fig1_yr, use_container_width=True)
+
+    with bottom_right:
+        st.markdown("### 4) Donor utilization – share of eligible donor assets used")
         st.markdown(
             "<div style='color: #666666; font-size: 0.9rem; margin-top: -6px; margin-bottom: 12px;'>"
             "Donor buckets are prioritized according to best transition efficiency = receiver–donor net spread / receiver-donor risk weight improvement. "
@@ -1843,6 +2378,24 @@ with left_col:
         )
 
         # Split utilization into CET1 vs Redeployment steps (stacked; redeployment semi-transparent)
+
+        # Allocations audit (from ROE transition engine) used to split utilization by step
+        alloc_f = None
+        try:
+            alloc_f = getattr(roe_df, "attrs", {}).get("allocations_audit_df", None)
+        except Exception:
+            alloc_f = None
+        if not isinstance(alloc_f, pd.DataFrame):
+            alloc_f = pd.DataFrame()
+        # Keep only combinations that are currently in sim_df (defensive against stale audits)
+        try:
+            key_cols = ["Scenario", "SRT_Efficiency", "Bank", "Years"]
+            if all(c in alloc_f.columns for c in key_cols) and all(c in sim_df.columns for c in key_cols):
+                _keys = sim_df[key_cols].drop_duplicates()
+                alloc_f = alloc_f.merge(_keys, on=key_cols, how="inner")
+        except Exception:
+            pass
+
         if "Step" in alloc_f.columns:
             used_by_step = (
                 alloc_f.groupby(["Bank", "Donor", "Step"], as_index=False)
@@ -1883,14 +2436,21 @@ with left_col:
         donor_util = used_piv.merge(donor_elig, on=["Bank", "Donor"], how="left")
         donor_util["Eligible_Exposure_EUR_bn"] = donor_util["Eligible_Exposure_EUR_bn"].fillna(0.0)
 
+        # --- STOCK CONSISTENCY ---
+        # With donor assets treated as a *stock* (distributed across the horizon inside the annual transition engine),
+        # Exposure_CET1 / Exposure_REDEPLOY are per-year usage. For utilization and the capacity indicator we want
+        # TOTAL usage over the horizon vs the eligible STOCK pool.
         denom = donor_util["Eligible_Exposure_EUR_bn"].replace(0.0, np.nan)
 
-        donor_util["Util_CET1_pct_Yr"] = 100.0 * donor_util["Exposure_CET1"] / denom
-        donor_util["Util_REDEPLOY_pct_Yr"] = 100.0 * donor_util["Exposure_REDEPLOY"] / denom
+        yrs_i = float(years) if "years" in globals() else 1.0
+        yrs_i = max(1.0, yrs_i)
+
+        donor_util["Util_CET1_pct"] = 100.0 * (donor_util["Exposure_CET1"] * yrs_i) / denom
+        donor_util["Util_REDEPLOY_pct"] = 100.0 * (donor_util["Exposure_REDEPLOY"] * yrs_i) / denom
         donor_util = donor_util.fillna(0.0)
 
-        donor_util["Util_CET1_pct_Yr"] = donor_util["Util_CET1_pct_Yr"].clip(lower=0, upper=100)
-        donor_util["Util_REDEPLOY_pct_Yr"] = donor_util["Util_REDEPLOY_pct_Yr"].clip(lower=0, upper=100)
+        donor_util["Util_CET1_pct"] = donor_util["Util_CET1_pct"].clip(lower=0, upper=100)
+        donor_util["Util_REDEPLOY_pct"] = donor_util["Util_REDEPLOY_pct"].clip(lower=0, upper=100)
 
         # Sort for stable display
         donor_util = donor_util.sort_values(["Donor", "Bank"])
@@ -1900,7 +2460,7 @@ with left_col:
         try:
             donors_required = ["B1_SME_TERM", "B1_MIDCORP_NONIG", "B1_EM_CORP", "B1_CRE_NON_HVCRE"]
             # Compute TOTAL utilization (Redeploy + CET1) on a per-bank, per-donor basis
-            donor_util["Util_TOTAL_pct_Yr"] = (donor_util["Util_CET1_pct_Yr"] + donor_util["Util_REDEPLOY_pct_Yr"]).clip(lower=0, upper=200)
+            donor_util["Util_TOTAL_pct"] = (donor_util["Util_CET1_pct"] + donor_util["Util_REDEPLOY_pct"]).clip(lower=0, upper=200)
 
             bank_full = {}
             for bank in banks_sel["Bank Name"].astype(str).tolist():
@@ -1916,11 +2476,11 @@ with left_col:
                         full_flags.append(False)
                     else:
                         # Treat as full if utilization is ~100% or above
-                        full_flags.append(float(row["Util_TOTAL_pct_Yr"].iloc[0]) >= 99.9)
+                        full_flags.append(float(row["Util_TOTAL_pct"].iloc[0]) >= 99.9)
                 bank_full[bank] = all(full_flags)
 
             if "bank_capacity_placeholder" in globals():
-                
+
                 with bank_capacity_placeholder:
                     # Preserve the order of banks as selected in the UI
                     sel_order = st.session_state.get("selected_banks", [])
@@ -1946,8 +2506,8 @@ with left_col:
             if d.empty:
                 continue
 
-            base_map = {str(r["Donor"]): float(r.get("Util_CET1_pct_Yr", 0.0) or 0.0) for _, r in d.iterrows()}
-            top_map = {str(r["Donor"]): float(r.get("Util_REDEPLOY_pct_Yr", 0.0) or 0.0) for _, r in d.iterrows()}
+            base_map = {str(r["Donor"]): float(r.get("Util_CET1_pct", 0.0) or 0.0) for _, r in d.iterrows()}
+            top_map = {str(r["Donor"]): float(r.get("Util_REDEPLOY_pct", 0.0) or 0.0) for _, r in d.iterrows()}
 
             base_vals = [base_map.get(str(x), 0.0) for x in donors_order]
             top_vals = [top_map.get(str(x), 0.0) for x in donors_order]
@@ -1993,173 +2553,150 @@ with left_col:
 
         st.plotly_chart(fig_util, use_container_width=True)
 
-        # --- Donor bucket weights per selected bank (from CSV) ---
-        donor_cols = {
-            "SME term (%)": "SME_term",
-            "Mid-corp non-IG (%)": "MidCorp_nonIG",
-            "EM corporates (%)": "EM_corporates",
-            "CRE non-HVCRE (%)": "CRE_non_HVCRE",
-        }
+# --- Donor bucket weights per selected bank (from CSV) ---
+    donor_cols = {
+        "SME term (%)": "SME_term",
+        "Mid-corp non-IG (%)": "MidCorp_nonIG",
+        "EM corporates (%)": "EM_corporates",
+        "CRE non-HVCRE (%)": "CRE_non_HVCRE",
+    }
 
-        cols_present = [c for c in donor_cols.values() if c in banks_sel.columns]
+    cols_present = [c for c in donor_cols.values() if c in banks_sel.columns]
 
-        if cols_present:
-            donor_tbl = (
-                banks_sel[["Bank Name"] + cols_present]
-                .rename(columns={"Bank Name": "Bank", **{v: k for k, v in donor_cols.items()}})
-                .sort_values("Bank")
+    if cols_present:
+        donor_tbl = (
+            banks_sel[["Bank Name"] + cols_present]
+            .rename(columns={"Bank Name": "Bank", **{v: k for k, v in donor_cols.items()}})
+            .sort_values("Bank")
+        )
+
+        # Compute per-bank maximum CET1 uplift (US advantage bps) at util=0 that would fully consume donor capacity
+        # (i.e., annual effective RWA reduction equals max achievable using all eligible donor buckets).
+        try:
+            # Eligible donor exposures per bank+donor (EUR bn) already reflect availability sliders and donor split overrides.
+            donor_elig_long = donor_eligible_exposure_long(
+                banks_sel,
+                donor_availability_pct_by_donor=donor_availability_pct,
+                donor_split_override_by_bank=donor_split_override,
             )
 
-            # Compute per-bank maximum CET1 uplift (US advantage bps) at util=0 that would fully consume donor capacity
-            # (i.e., annual effective RWA reduction equals max achievable using all eligible donor buckets).
-            try:
-                # Eligible donor exposures per bank+donor (EUR bn) already reflect availability sliders and donor split overrides.
-                donor_elig_long = donor_eligible_exposure_long(
-                    banks_sel,
+            # Build a quick lookup: (bank, donor) -> eligible exposure (EUR bn)
+            elig_lookup = {}
+            for _, r in donor_elig_long.iterrows():
+                elig_lookup[(str(r["Bank"]), str(r["Donor"]))] = float(r.get("Eligible_Exposure_EUR_bn", 0.0) or 0.0)
+
+            # Per selected bank, compute the max annual effective RWA reduction by allocating an oversized target.
+            max_adv_map = {}
+            yrs_i = float(years) if "years" in globals() else 1.0
+            yrs_i = max(1.0, yrs_i)
+
+            for _, b in banks_sel.iterrows():
+                bank = str(b["Bank Name"])
+                R = float(b["Total RWA (EUR bn)"])
+                cet1_ratio = float(b["CET1 Ratio (%)"]) / 100.0
+                C = cet1_ratio * R
+
+                donor_expo = {
+                    "B1_SME_TERM": elig_lookup.get((bank, "B1_SME_TERM"), 0.0),
+                    "B1_MIDCORP_NONIG": elig_lookup.get((bank, "B1_MIDCORP_NONIG"), 0.0),
+                    "B1_EM_CORP": elig_lookup.get((bank, "B1_EM_CORP"), 0.0),
+                    "B1_CRE_NON_HVCRE": elig_lookup.get((bank, "B1_CRE_NON_HVCRE"), 0.0),
+                }
+
+                # Use the current SRT efficiency setting (doesn't materially affect RWA-reduction quantity if
+                # the allocator only scales effective reduction by eff; but we pass it for consistency).
+                srt_eff_dec = float(srt_eff) if "srt_eff" in globals() else 0.75
+
+                alloc_cap = allocate_rwa_reduction_equal_receivers(
+                    1e12, donor_expo, srt_eff_dec, 0.0,
                     donor_availability_pct_by_donor=donor_availability_pct,
-                    donor_split_override_by_bank=donor_split_override,
                 )
+                eff_max_yr = float(alloc_cap.get("total_rwa_reduction_eur_bn", 0.0) or 0.0)
 
-                # Build a quick lookup: (bank, donor) -> eligible exposure (EUR bn)
-                elig_lookup = {}
-                for _, r in donor_elig_long.iterrows():
-                    elig_lookup[(str(r["Bank"]), str(r["Donor"]))] = float(r.get("Eligible_Exposure_EUR_bn", 0.0) or 0.0)
+                eff_max_tot = eff_max_yr  # donor stock (no x years)
 
-                # Per selected bank, compute the max annual effective RWA reduction by allocating an oversized target.
-                max_adv_map = {}
-                yrs_i = float(years) if "years" in globals() else 1.0
-                yrs_i = max(1.0, yrs_i)
+                # Avoid division by zero / negative RWAs
+                eff_max_tot = min(eff_max_tot, max(R - 1e-9, 0.0))
 
-                for _, b in banks_sel.iterrows():
-                    bank = str(b["Bank Name"])
-                    R = float(b["Total RWA (EUR bn)"])
-                    cet1_ratio = float(b["CET1 Ratio (%)"]) / 100.0
-                    C = cet1_ratio * R
+                if eff_max_tot <= 0 or (R - eff_max_tot) <= 0:
+                    max_adv_map[bank] = np.nan
+                    continue
 
-                    donor_expo = {
-                        "B1_SME_TERM": elig_lookup.get((bank, "B1_SME_TERM"), 0.0),
-                        "B1_MIDCORP_NONIG": elig_lookup.get((bank, "B1_MIDCORP_NONIG"), 0.0),
-                        "B1_EM_CORP": elig_lookup.get((bank, "B1_EM_CORP"), 0.0),
-                        "B1_CRE_NON_HVCRE": elig_lookup.get((bank, "B1_CRE_NON_HVCRE"), 0.0),
-                    }
+                target_ratio = C / (R - eff_max_tot)
+                delta = target_ratio - cet1_ratio
+                max_adv_map[bank] = delta * 10000.0
 
-                    # Use the current SRT efficiency setting (doesn't materially affect RWA-reduction quantity if
-                    # the allocator only scales effective reduction by eff; but we pass it for consistency).
-                    srt_eff_dec = float(srt_eff) if "srt_eff" in globals() else 0.75
-
-                    alloc_cap = allocate_rwa_reduction_equal_receivers(
-                        1e12, donor_expo, srt_eff_dec, 0.0,
-                        donor_availability_pct_by_donor=donor_availability_pct,
-                    )
-                    eff_max_yr = float(alloc_cap.get("total_rwa_reduction_eur_bn", 0.0) or 0.0)
-
-                    eff_max_tot = eff_max_yr * yrs_i
-
-                    # Avoid division by zero / negative RWAs
-                    eff_max_tot = min(eff_max_tot, max(R - 1e-9, 0.0))
-
-                    if eff_max_tot <= 0 or (R - eff_max_tot) <= 0:
-                        max_adv_map[bank] = np.nan
-                        continue
-
-                    target_ratio = C / (R - eff_max_tot)
-                    delta = target_ratio - cet1_ratio
-                    max_adv_map[bank] = delta * 10000.0
-
-                donor_tbl["Max. Reg. Divergence (bp)"] = donor_tbl["Bank"].map(max_adv_map).round(0).astype("Int64")
-                # Compute per-bank maximum ROE uplift (bp p.a.) assuming:
-                # - all available donor capacity is used for redeployment (no capacity spent on CET1 uplift),
-                # - same greedy transition allocator as in chart (2).
-                try:
-                    sim_df_max = sim_df.copy()
-                    # Force an oversized RWA reduction target so the allocator is capacity-constrained (not target-constrained).
-                    sim_df_max["Effective_RWA_Reduction_EUR_bn_Tot"] = 1e12
-                    sim_df_max["Gross_RWA_Offload_EUR_bn_Tot"] = 1e12
-
-                    roe_df_maxcap = compute_roe_delta_transitions_greedy(
-                        sim_df_max,
-                        banks_sel,
-                        util=100.0,  # will be clamped inside allocator to ~1.0 => redeployment consumes all capacity
-                        apply_util_target_scaling=True,
-                        override_srt_cost_bp=override_srt_cost_bp,
-                        override_tax_rate=override_tax_rate,
-                        require_exact_target=False,
-                        target_tolerance_pct=tol_pct,
-                        donor_availability_pct_by_donor=donor_availability_pct,
-                        receiver_split_by_donor=receiver_split_by_donor,
-                    )
-
-                    max_roe_map = (
-                        roe_df_maxcap.groupby("Bank")["ROE_delta_bp"].max().to_dict()
-                        if isinstance(roe_df_maxcap, pd.DataFrame) and not roe_df_maxcap.empty
-                        else {}
-                    )
-                    donor_tbl["Max. ROE uplift (bp)"] = donor_tbl["Bank"].map(max_roe_map).round(0).astype("Int64")
-                except Exception:
-                    donor_tbl["Max. ROE uplift (bp)"] = np.nan
-
-            except Exception:
-                donor_tbl["Max. Reg. Divergence (bp)"] = np.nan
+            donor_tbl["Max. Reg. Divergence (bp)"] = donor_tbl["Bank"].map(max_adv_map).round(0).astype("Int64")
+            
 
 
-            # --- RWA offload (CET1 uplift + ROE uplift) per bank ---
-            try:
-                audit_df = getattr(roe_df, "attrs", {}).get("allocations_audit_df", None)
-                if isinstance(audit_df, pd.DataFrame) and not audit_df.empty:
-                    # Sum annual RWA reductions by step and convert to total-horizon RWAs
-                    by_step = (
-                        audit_df.groupby(["Bank", "Step"], dropna=False)["RWA_reduction_EUR_bn_Yr"]
-                        .sum()
-                        .unstack(fill_value=0.0)
-                    )
-                    rwa_cet1_tot = by_step.get("CET1", 0.0) * float(years)
-                    rwa_roe_tot = by_step.get("REDEPLOY", 0.0) * float(years)
-                    rwa_sum_map = (rwa_cet1_tot + rwa_roe_tot).to_dict()
-                    donor_tbl["RWA freed (EUR bn)"] = donor_tbl["Bank"].map(rwa_sum_map).round(0).astype("Int64").astype("Int64")
-                else:
-                    donor_tbl["RWA freed (EUR bn)"] = np.nan
-            except Exception:
+        except Exception:
+            donor_tbl["Max. Reg. Divergence (bp)"] = np.nan
+
+
+        # --- RWA offload (CET1 uplift + ROE uplift) per bank ---
+        try:
+            audit_df = getattr(roe_df, "attrs", {}).get("allocations_audit_df", None)
+            if isinstance(audit_df, pd.DataFrame) and not audit_df.empty:
+                # Sum annual RWA reductions by step and convert to total-horizon RWAs
+                by_step = (
+                    audit_df.groupby(["Bank", "Step"], dropna=False)["RWA_reduction_EUR_bn_Yr"]
+                    .sum()
+                    .unstack(fill_value=0.0)
+                )
+                rwa_cet1_tot = by_step.get("CET1", 0.0) * float(years)
+                rwa_roe_tot = by_step.get("REDEPLOY", 0.0) * float(years)
+                rwa_sum_map = (rwa_cet1_tot + rwa_roe_tot).to_dict()
+                donor_tbl["RWA freed (EUR bn)"] = donor_tbl["Bank"].map(rwa_sum_map).round(0).astype("Int64").astype("Int64")
+            else:
                 donor_tbl["RWA freed (EUR bn)"] = np.nan
+        except Exception:
+            donor_tbl["RWA freed (EUR bn)"] = np.nan
 
-            st.markdown("**Donor bucket weights per selected bank (from input data)**")
-            st.dataframe(
-                donor_tbl,
-                column_config={
-                    "RWA freed (EUR bn)": st.column_config.NumberColumn(
-                        "RWA freed (EUR bn)", format="%.0f"
-                    )
-                },
-                use_container_width=True,
-                hide_index=True,
-            )
+        st.markdown("**Donor bucket weights per selected bank (from input data)**")
+        donor_tbl_display = donor_tbl.drop(columns=["Max. Reg. Divergence (bp)"], errors="ignore")
+
+        st.dataframe(
+            donor_tbl_display,
+            column_config={
+                "RWA freed (EUR bn)": st.column_config.NumberColumn(
+                    "RWA freed (EUR bn)", format="%.0f"
+                )
+            },
+            use_container_width=True,
+            hide_index=True,
+        )
 
     st.markdown("---")
     st.subheader("PORTFOLIO (aggregate across selected banks)")
 
     # Required offload portfolio = sum of chart (1) across banks (keep CET1/ROE split)
-    yv = yv_simple
     yl = "Offloaded assets (EUR bn, total, transition-based) — sum across banks"
 
-    # Rebuild the same CET1 vs ROE split used in chart (1)
-    _util_disp_p = min(float(util), 0.999)
-    _factor_p = _util_disp_p / (1.0 - _util_disp_p)  # == util/(1-util)
+    _tmp_port = sim_df[[        "Scenario",
+        "SRT_Efficiency",
+        "Bank",
+        "Assets_Offloaded_CET1_Transition_EUR_bn_Tot",
+        "Assets_Offloaded_ROE_Transition_EUR_bn_Tot",
+    ]].copy()
+    _tmp_port["Assets_Offloaded_CET1_Transition_EUR_bn_Tot"] = _tmp_port["Assets_Offloaded_CET1_Transition_EUR_bn_Tot"].fillna(0.0)
+    _tmp_port["Assets_Offloaded_ROE_Transition_EUR_bn_Tot"] = _tmp_port["Assets_Offloaded_ROE_Transition_EUR_bn_Tot"].fillna(0.0)
 
     port_base = (
-        sim_df.groupby(["Scenario", "SRT_Efficiency"], as_index=False)[yv]
-        .sum()
-        .rename(columns={yv: "CET1_uplift_assets"})
+        _tmp_port.groupby(["Scenario", "SRT_Efficiency"], as_index=False)[
+            ["Assets_Offloaded_CET1_Transition_EUR_bn_Tot", "Assets_Offloaded_ROE_Transition_EUR_bn_Tot"]
+        ].sum()
     )
-    port_base["ROE_uplift_assets"] = port_base["CET1_uplift_assets"] * _factor_p
 
     port_long = port_base.melt(
         id_vars=["Scenario", "SRT_Efficiency"],
-        value_vars=["CET1_uplift_assets", "ROE_uplift_assets"],
+        value_vars=["Assets_Offloaded_CET1_Transition_EUR_bn_Tot", "Assets_Offloaded_ROE_Transition_EUR_bn_Tot"],
         var_name="Component",
         value_name="Assets_offloaded_EUR_bn",
     )
     port_long["Component"] = port_long["Component"].map({
-        "CET1_uplift_assets": "CET1-uplift",
-        "ROE_uplift_assets": "ROE-uplift",
+        "Assets_Offloaded_CET1_Transition_EUR_bn_Tot": "CET1-uplift",
+        "Assets_Offloaded_ROE_Transition_EUR_bn_Tot": "ROE-uplift",
     })
     # Ensure one bar per Scenario/Component/(SRT_Efficiency) so Plotly can stack reliably
     port_long = (
