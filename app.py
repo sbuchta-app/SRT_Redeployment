@@ -10,7 +10,7 @@ TOTAL_ASSETS_COL = "Total Assets (EUR bn)"
 DEFAULT_SRT_COST_PCT = 0.2  # percent (0.2% = 20 bps)
 
 # Multiplier to increase the donor capacity made available to the allocator (annualized capacity).
-ALLOCATOR_CAPACITY_MULTIPLIER = 3.0
+ALLOCATOR_CAPACITY_MULTIPLIER = 1.0
 
 
 import numpy as np
