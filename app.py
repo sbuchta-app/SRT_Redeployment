@@ -115,7 +115,7 @@ DONOR_RISK_WEIGHT: Dict[str, float] = {
     "B1_SME_TERM": 1.20,
     "B1_MIDCORP_NONIG": 0.90,
     "B1_EM_CORP": 1.00,
-    "B1_CRE_NON_HVCRE": 1.00,
+    "B1_CRE_NON_HVCRE": 1.40,
 }
 
 RECEIVER_RISK_WEIGHT: Dict[str, float] = {
