@@ -1451,10 +1451,10 @@ with _tc3:
 
     st.markdown("**SRT-eligible share of donor assets**")
     # Defaults requested: availability sliders start at 5 (max is still 10)
-    avail_sme = st.slider("SME term available for SRT (%) — RW 120%", 0, 20, 10, 1, key="avail_sme")
-    avail_mid = st.slider("Mid-corp non-IG available for SRT (%) — RW 90%", 0, 20, 10, 1, key="avail_mid")
+    avail_sme = st.slider("SME term available for SRT (%) — RW 130%", 0, 20, 10, 1, key="avail_sme")
+    avail_mid = st.slider("Mid-corp non-IG available for SRT (%) — RW 110%", 0, 20, 10, 1, key="avail_mid")
     avail_em = st.slider("EM corporates available for SRT (%) — RW 100%", 0, 20, 10, 1, key="avail_em")
-    avail_cre = st.slider("CRE non-HVCRE available for SRT (%) — RW 140%", 0, 20, 10, 1, key="avail_cre")
+    avail_cre = st.slider("CRE non-HVCRE available for SRT (%) — RW 145%", 0, 20, 10, 1, key="avail_cre")
 
     # Donor availability caps (% of each donor bucket, per year)
     donor_availability_pct = {
