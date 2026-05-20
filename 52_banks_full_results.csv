@@ -1,7 +1,7 @@
 Bank Name,Country,Region,Total Assets (EUR bn),Total RWA (EUR bn),CET1 Ratio (%),RWA Density (%),Net Spread (%),SRT Cost (%),Effective Tax Rate (%),Reporting Period,SME_term,MidCorp_nonIG,EM_corporates,CRE_non_HVCRE
 DekaBank,Germany,Western Europe,96.06,30.61,19.9,31.8,,,31.2,H1 2025,2.8,3.5,0.7,11.9
 DZ BANK,Germany,Western Europe,666.0,151.5,17.9,22.7,,,29.8,H1 2025,2.8,9.7,0.7,6.0
-Deutsche Bank,Germany,Western Europe,1398.0,341.0,14.2,24.4,,,28.0,H1 2025,3.2,8.6,1.45,3.9
+Deutsche Bank,Germany,Western Europe,1398.0,341.0,14.2,24.4,,,28.0,H1 2025,3.2,8.6,1.45,9.3
 Commerzbank,Germany,Western Europe,581.8,176.1,14.6,30.3,,,24.5,H1 2025,14,6,7.4,2.3
 LBBW,Germany,Western Europe,369.0,85.7,16.6,23.2,,,32.3,H1 2025,7.4,11.0,1.6,7.7
 BayernLB,Germany,Western Europe,282.48,63.5,20.5,22.5,,,23.5,H1 2025,5.0,4.0,1.0,15.0
